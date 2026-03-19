@@ -2,9 +2,9 @@
 set -ex
 
 # 设置目录
-PROTO_DIR="docreader/proto"
-PYTHON_OUT="docreader/proto"
-GO_OUT="docreader/proto"
+PROTO_DIR="./proto"
+PYTHON_OUT="./proto"
+GO_OUT="./proto"
 
 # 生成Python代码
 python3 -m grpc_tools.protoc -I${PROTO_DIR} \

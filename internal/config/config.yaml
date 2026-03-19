@@ -1,0 +1,83 @@
+# 服务器配置
+server:
+  port: 8080                    # 服务器监听端口
+  host: "0.0.0.0"              # 服务器绑定地址
+  log_path: "./logs/backend.log" # 日志文件路径
+  shutdown_timeout: 30s         # 关闭超时时间
+
+# 对话服务配置
+conversation:
+  max_rounds: 10
+  keyword_threshold: 0.3
+  embedding_top_k: 10
+  vector_threshold: 0.5
+  rerank_top_k: 10
+  rerank_threshold: 0.3
+  fallback_strategy: "model"
+  fallback_response: "抱歉，我暂时无法回答您的问题"
+  enable_rewrite: true
+  enable_query_expansion: true
+  summary:
+    max_tokens: 512
+    temperature: 0.7
+    prompt: "请总结以下内容"
+
+# 知识库配置
+knowledge_base:
+  chunk_size: 1000
+  chunk_overlap: 200
+  split_markers: ["\n\n", "\n", "。", "！", "？", ".", "!", "?"]
+  keep_separator: true
+  image_processing:
+    enable_multimodal: false
+
+# 租户配置
+tenant:
+  default_session_name: "新对话"
+  default_session_title: "新对话标题"
+  default_session_description: "新对话描述"
+  enable_cross_tenant_access: false
+
+# 向量数据库配置
+vector_database:
+  driver: "postgres"  # 可选: postgres, sqlite, mysql
+
+# 文档阅读器配置
+docreader:
+  addr: "localhost:50051"
+
+# 流管理器配置
+stream_manager:
+  type: "memory"  # 可选: memory, redis
+  cleanup_timeout: 300s
+  redis:
+    address: "localhost:6379"
+    password: ""
+    db: 0
+    prefix: "weknora:"
+    ttl: 24h
+
+# 抽取管理器配置
+extract:
+  extract_graph:
+    system: "根据以下内容提取图谱信息"
+    user: "内容: {{content}}"
+  extract_entity:
+    system: "提取实体信息"
+    user: "文本: {{text}}"
+  fabri_text:
+    with_tag: "标记文本: {{text}}"
+    with_no_tag: "纯文本: {{text}}"
+
+# 模型配置
+models:
+  - type: "ollama"
+    source: "local"
+    model_name: "llama2"
+    parameters:
+      temperature: 0.7
+      max_tokens: 2048
+
+# 网络搜索配置
+web_search:
+  timeout: 10
