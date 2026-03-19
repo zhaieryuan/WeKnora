@@ -159,7 +159,7 @@ HTML_TEMPLATE = """
             padding: 16px;
             border-radius: 8px;
             margin-top: 16px;
-            max-height: 400px;
+            max-height: none;
             overflow-y: auto;
             font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
             font-size: 13px;
@@ -511,7 +511,9 @@ HTML_TEMPLATE = """
                     images: result.image_refs || [],
                     metadata: result.metadata || {}
                 };
-                content.innerHTML = `
+
+                // 先显示头部信息
+                let headerHtml = `
 <div style="color: #10b981;">✓ 解析成功</div>
 <div style="margin-top: 12px;">
 <div><strong>内容长度:</strong> ${summary.markdown_length} 字符</div>
@@ -519,11 +521,41 @@ HTML_TEMPLATE = """
 ${summary.images.length > 0 ? `<div><strong>图片:</strong></div>${summary.images.map(img => `  - ${img.filename} (${img.mime_type})`).join('<br>')}` : ''}
 </div>
 <hr style="border-color: #334155; margin: 12px 0;">
-<div style="color: #64748b;">Markdown 内容预览 (前 500 字符):</div>
-<pre style="color: #e2e8f0; white-space: pre-wrap;">${escapeHtml((result.markdown_content || '').substring(0, 500))}</pre>
-${result.markdown_content?.length > 500 ? '<div style="color: #64748b; margin-top: 8px;">... (内容已截断)</div>' : ''}
-                `;
+<div style="color: #64748b; margin-bottom: 8px;">Markdown 内容 (流式输出):</div>
+`;
+                content.innerHTML = headerHtml + '<pre id="streaming-content" style="color: #e2e8f0; white-space: pre-wrap;"></pre>';
+
+                // 流式输出内容
+                streamMarkdown(result.markdown_content || '');
             }
+        }
+
+        // 流式输出 Markdown 内容
+        function streamMarkdown(text) {
+            const target = document.getElementById('streaming-content');
+            if (!target) return;
+
+            const chunkSize = 100; // 每次显示的字符数
+            let index = 0;
+
+            function displayNextChunk() {
+                if (index >= text.length) {
+                    return;
+                }
+
+                const end = Math.min(index + chunkSize, text.length);
+                const chunk = text.substring(index, end);
+                target.textContent += escapeHtml(chunk);
+                index = end;
+
+                // 滚动到底部
+                target.scrollTop = target.scrollHeight;
+
+                // 继续下一块
+                requestAnimationFrame(displayNextChunk);
+            }
+
+            displayNextChunk();
         }
 
         function escapeHtml(text) {

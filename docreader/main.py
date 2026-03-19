@@ -41,7 +41,7 @@ for handler in logging.root.handlers[:]:
 handler = logging.StreamHandler(sys.stdout)
 logging.root.addHandler(handler)
 
-_level_name = (os.environ.get("LOG_LEVEL") or "INFO").upper()
+_level_name = (os.environ.get("LOG_LEVEL") or "DEBUG").upper()
 _level = getattr(logging, _level_name, logging.INFO)
 logging.root.setLevel(_level)
 
