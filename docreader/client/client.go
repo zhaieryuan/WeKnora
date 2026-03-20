@@ -54,7 +54,7 @@ func NewClient(addr string) (*Client, error) {
 	resolver.SetDefaultScheme("dns")
 
 	startTime := time.Now()
-	conn, err := grpc.Dial("dns:///"+addr, opts...)
+	conn, err := grpc.NewClient("dns:///"+addr, opts...)
 	if err != nil {
 		Logger.Printf("ERROR: Failed to connect to DocReader service: %v", err)
 		return nil, err
@@ -64,7 +64,7 @@ func NewClient(addr string) (*Client, error) {
 	return &Client{
 		conn:            conn,
 		DocReaderClient: proto.NewDocReaderClient(conn),
-		debug:           false,
+		debug:           true,
 	}, nil
 }
 
