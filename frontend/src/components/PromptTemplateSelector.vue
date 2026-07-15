@@ -1,55 +1,73 @@
 <template>
   <div class="prompt-template-selector" :class="{ 'position-corner': position === 'corner' }">
-    <t-popup
-      trigger="click"
-      placement="top-right"
-      :visible="popupVisible"
-      @visible-change="handleVisibleChange"
-    >
-      <template #content>
-        <div class="template-popup">
-          <div class="template-header">
-            <span class="template-title">{{ $t('promptTemplate.selectTemplate') }}</span>
-          </div>
-          <div v-if="loading" class="template-loading">
-            <t-loading size="small" />
-          </div>
-          <div v-else-if="templates.length === 0" class="template-empty">
-            {{ $t('promptTemplate.noTemplates') }}
-          </div>
-          <div v-else class="template-list">
-            <div
-              v-for="template in templates"
-              :key="template.id"
-              class="template-item"
-              @click="selectTemplate(template)"
-            >
-              <div class="template-item-header">
-                <span class="template-name">{{ getTemplateName(template) }}</span>
-                <span v-if="template.has_knowledge_base" class="template-tag kb-tag">
-                  <t-icon name="folder" size="12px" />
-                  {{ $t('promptTemplate.withKnowledgeBase') }}
-                </span>
-                <span v-if="template.has_web_search" class="template-tag web-tag">
-                  <t-icon name="internet" size="12px" />
-                  {{ $t('promptTemplate.withWebSearch') }}
-                </span>
+    <div class="template-btn-group">
+      <!-- 恢复默认按钮 -->
+      <t-button
+        variant="text"
+        size="small"
+        class="template-default-btn"
+        :loading="resettingDefault"
+        @click="handleResetToDefault"
+      >
+        <t-icon name="rollback" />
+        <span>{{ $t('promptTemplate.resetDefault') }}</span>
+      </t-button>
+      <!-- 选择模板按钮 -->
+      <t-popup
+        v-if="showTemplatePicker"
+        trigger="click"
+        placement="top-right"
+        :visible="popupVisible"
+        @visible-change="handleVisibleChange"
+      >
+        <template #content>
+          <div class="template-popup">
+            <div class="template-header">
+              <span class="template-title">{{ $t('promptTemplate.selectTemplate') }}</span>
+            </div>
+            <div v-if="loading" class="template-loading">
+              <t-loading size="small" />
+            </div>
+            <div v-else-if="templates.length === 0" class="template-empty">
+              {{ $t('promptTemplate.noTemplates') }}
+            </div>
+            <div v-else class="template-list">
+              <div
+                v-for="template in templates"
+                :key="template.id"
+                class="template-item"
+                @click="selectTemplate(template)"
+              >
+                <div class="template-item-header">
+                  <span class="template-name">{{ template.name }}</span>
+                  <span v-if="template.default" class="template-tag default-tag">
+                    {{ $t('promptTemplate.default') }}
+                  </span>
+                  <span v-if="template.has_knowledge_base" class="template-tag kb-tag">
+                    <t-icon name="folder" size="12px" />
+                    {{ $t('promptTemplate.withKnowledgeBase') }}
+                  </span>
+                  <span v-if="template.has_web_search" class="template-tag web-tag">
+                    <t-icon name="internet" size="12px" />
+                    {{ $t('promptTemplate.withWebSearch') }}
+                  </span>
+                </div>
+                <p class="template-desc">{{ template.description }}</p>
               </div>
-              <p class="template-desc">{{ getTemplateDesc(template) }}</p>
             </div>
           </div>
-        </div>
-      </template>
-      <t-button
-        variant="outline"
-        size="small"
-        class="template-trigger-btn"
-        :loading="loading"
-      >
-        <t-icon name="view-module" />
-        <span>{{ $t('promptTemplate.useTemplate') }}</span>
-      </t-button>
-    </t-popup>
+        </template>
+        <t-button
+          variant="outline"
+          size="small"
+          class="template-trigger-btn"
+          :loading="loading"
+        >
+          <t-icon name="view-module" />
+          <span>{{ $t('promptTemplate.useTemplate') }}</span>
+        </t-button>
+      </t-popup>
+    </div>
   </div>
 </template>
 
@@ -60,70 +78,29 @@ import { getPromptTemplates, type PromptTemplate, type PromptTemplatesConfig } f
 
 const { t } = useI18n();
 
-const props = defineProps<{
-  type: 'systemPrompt' | 'contextTemplate' | 'rewriteSystem' | 'rewriteUser' | 'fallback';
+const props = withDefaults(defineProps<{
+  type: 'systemPrompt' | 'contextTemplate' | 'rewrite' | 'fallback' | 'agentSystemPrompt' | 'intentPrompt';
   hasKnowledgeBase?: boolean;
   position?: 'inline' | 'corner';  // inline: 行内显示, corner: 输入框右下角
-}>();
+  /** 用于 fallback 场景：区分固定回复和模型 prompt */
+  fallbackMode?: 'fixed' | 'model';
+  /** intent 场景：当前选中的 intent id（对应 template.id） */
+  intentId?: string;
+  /** 为 false 时只显示「恢复默认」，不显示「使用模板」 */
+  showTemplatePicker?: boolean;
+}>(), {
+  showTemplatePicker: true,
+});
 
 const emit = defineEmits<{
-  (e: 'select', content: string): void;
+  (e: 'select', template: PromptTemplate): void;
+  (e: 'reset-default', template: PromptTemplate): void;
 }>();
 
 const popupVisible = ref(false);
 const loading = ref(false);
+const resettingDefault = ref(false);
 const templatesConfig = ref<PromptTemplatesConfig | null>(null);
-
-const templateI18nKeyMap: Record<string, Record<string, string>> = {
-  systemPrompt: {
-    default_kb: 'defaultKB',
-    expert_assistant: 'expert',
-    customer_service: 'customerService',
-    technical_support: 'techSupport',
-    pure_chat: 'pureChat',
-    web_search_assistant: 'webSearch',
-  },
-  contextTemplate: {
-    default_context: 'default',
-    detailed_context: 'detailed',
-    simple_context: 'simple',
-    qa_context: 'qa',
-  },
-  rewriteSystem: {
-    default_rewrite_system: 'default',
-    strict_rewrite_system: 'strict',
-  },
-  rewriteUser: {
-    default_rewrite_user: 'default',
-    detailed_rewrite_user: 'detailed',
-  },
-  fallback: {
-    default_fallback: 'default',
-    polite_fallback: 'polite',
-    brief_fallback: 'brief',
-    model_fallback: 'model',
-  },
-};
-
-function getTemplateName(template: PromptTemplate): string {
-  const key = templateI18nKeyMap[props.type]?.[template.id];
-  if (key) {
-    const i18nKey = `promptTemplate.${props.type}.${key}.name`;
-    const translated = t(i18nKey);
-    if (translated !== i18nKey) return translated;
-  }
-  return template.name;
-}
-
-function getTemplateDesc(template: PromptTemplate): string {
-  const key = templateI18nKeyMap[props.type]?.[template.id];
-  if (key) {
-    const i18nKey = `promptTemplate.${props.type}.${key}.desc`;
-    const translated = t(i18nKey);
-    if (translated !== i18nKey) return translated;
-  }
-  return template.description;
-}
 
 const handleVisibleChange = async (visible: boolean) => {
   popupVisible.value = visible;
@@ -150,25 +127,78 @@ const loadTemplates = async () => {
 const templates = computed<PromptTemplate[]>(() => {
   if (!templatesConfig.value) return [];
   
+  let list: PromptTemplate[] = [];
   switch (props.type) {
     case 'systemPrompt':
-      return templatesConfig.value.system_prompt || [];
+      list = templatesConfig.value.system_prompt || [];
+      break;
     case 'contextTemplate':
-      return templatesConfig.value.context_template || [];
-    case 'rewriteSystem':
-      return templatesConfig.value.rewrite_system || [];
-    case 'rewriteUser':
-      return templatesConfig.value.rewrite_user || [];
+      list = templatesConfig.value.context_template || [];
+      break;
+    case 'rewrite':
+      list = templatesConfig.value.rewrite || [];
+      break;
     case 'fallback':
-      return templatesConfig.value.fallback || [];
+      list = templatesConfig.value.fallback || [];
+      // Filter by fallbackMode: "model" mode shows only mode:"model" templates, otherwise shows non-model templates
+      if (props.fallbackMode === 'model') {
+        list = list.filter(t => t.mode === 'model');
+      } else if (props.fallbackMode === 'fixed') {
+        list = list.filter(t => !t.mode || t.mode !== 'model');
+      }
+      break;
+    case 'agentSystemPrompt':
+      list = templatesConfig.value.agent_system_prompt || [];
+      break;
+    case 'intentPrompt':
+      list = templatesConfig.value.intent_prompts || [];
+      break;
     default:
-      return [];
+      list = [];
   }
+  return list;
 });
 
 const selectTemplate = (template: PromptTemplate) => {
-  emit('select', template.content);
+  emit('select', template);
   popupVisible.value = false;
+};
+
+// Find the default template (marked with default: true, or the first one)
+const findDefaultTemplate = (list: PromptTemplate[]): PromptTemplate | null => {
+  if (!list || list.length === 0) return null;
+  const defaultItem = list.find(t => t.default);
+  return defaultItem || list[0];
+};
+
+const resolveResetTemplate = (): PromptTemplate | null => {
+  const list = templates.value;
+  if (props.type === 'intentPrompt') {
+    if (!props.intentId) return null;
+    return list.find((t) => t.id === props.intentId) ?? null;
+  }
+  return findDefaultTemplate(list);
+};
+
+// Reset to default template content
+const handleResetToDefault = async () => {
+  if (!templatesConfig.value) {
+    resettingDefault.value = true;
+    try {
+      const response = await getPromptTemplates();
+      templatesConfig.value = response.data;
+    } catch (error) {
+      console.error('Failed to load prompt templates:', error);
+      return;
+    } finally {
+      resettingDefault.value = false;
+    }
+  }
+
+  const defaultTpl = resolveResetTemplate();
+  if (defaultTpl) {
+    emit('reset-default', defaultTpl);
+  }
 };
 
 // 预加载模板（可选）
@@ -187,6 +217,38 @@ onMounted(() => {
     right: 8px;
     bottom: 8px;
     z-index: 10;
+  }
+}
+
+.template-btn-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.template-default-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--td-text-color-placeholder);
+  font-size: 12px;
+  height: 26px;
+  padding: 0 6px;
+
+  &:hover {
+    color: var(--td-brand-color);
+  }
+  
+  :deep(.t-button__text) {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  
+  :deep(.t-icon) {
+    font-size: 14px;
+    vertical-align: middle;
+    line-height: 1;
   }
 }
 
@@ -299,6 +361,12 @@ onMounted(() => {
   &.web-tag {
     background: var(--td-success-color-light);
     color: var(--td-brand-color);
+  }
+
+  &.default-tag {
+    background: var(--td-warning-color-light);
+    color: var(--td-warning-color);
+    font-weight: 500;
   }
 }
 

@@ -12,11 +12,14 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/types"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/sashabaranov/go-openai"
 )
 
-// RemoteAPIChat 实现了基于 OpenAI 兼容 API 的聊天
-// 这是一个通用实现，不包含任何 provider 特定的逻辑
+// RemoteAPIChat 实现了基于 OpenAI 兼容 API 的聊天。
+// 它本身只负责通用的请求/响应/流式处理；所有 provider 特定行为都委托给
+// providerAdapter（见 provider.go），thinking 编码委托给 ThinkingStrategy
+// （见 thinking.go）。
 type RemoteAPIChat struct {
 	modelName string
 	client    *openai.Client
@@ -24,199 +27,209 @@ type RemoteAPIChat struct {
 	baseURL   string
 	apiKey    string
 	provider  provider.ProviderName
+	appID     string
+	appSecret string
+	// customHeaders 为用户在模型配置中指定的自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+	customHeaders map[string]string
 
-	// requestCustomizer 允许子类自定义请求
-	// 返回自定义请求体（如果为 nil 则使用标准请求）和是否需要使用原始 HTTP 请求
-	requestCustomizer func(req *openai.ChatCompletionRequest, opts *ChatOptions, isStream bool) (customReq any, useRawHTTP bool)
+	// adapter 承载所有 provider 特定行为（thinking / 参数特判 / endpoint / 鉴权 / 消息变换）。
+	adapter providerAdapter
+	// thinkingOverride 来自 extra_config.thinking_control，非 nil 时覆盖 adapter.Thinking()。
+	thinkingOverride ThinkingStrategy
 }
 
 // NewRemoteAPIChat 创建远程 API 聊天实例
 func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
-	apiKey := chatConfig.APIKey
-	config := openai.DefaultConfig(apiKey)
-	if baseURL := chatConfig.BaseURL; baseURL != "" {
-		config.BaseURL = baseURL
+	if chatConfig.BaseURL != "" {
+		if err := secutils.ValidateURLForSSRF(chatConfig.BaseURL); err != nil {
+			return nil, fmt.Errorf("baseURL SSRF check failed: %w", err)
+		}
 	}
 
+	apiKey := chatConfig.APIKey
 	providerName := provider.ProviderName(chatConfig.Provider)
 	if providerName == "" {
 		providerName = provider.DetectProvider(chatConfig.BaseURL)
 	}
 
+	var config openai.ClientConfig
+	if providerName == provider.ProviderAzureOpenAI {
+		config = openai.DefaultAzureConfig(apiKey, chatConfig.BaseURL)
+		config.AzureModelMapperFunc = func(model string) string {
+			return model
+		}
+		if chatConfig.ExtraConfig != nil {
+			if v, ok := chatConfig.ExtraConfig["api_version"]; ok {
+				config.APIVersion = v
+			}
+		}
+	} else {
+		config = openai.DefaultConfig(apiKey)
+		if baseURL := chatConfig.BaseURL; baseURL != "" {
+			config.BaseURL = baseURL
+		}
+	}
+
+	// 如果指定了 CustomHeaders，则给 SDK 使用的 HTTPClient 挂一层 RoundTripper，
+	// 在每个请求上自动注入这些 header（raw HTTP 路径会在发送前单独处理）。
+	if len(chatConfig.CustomHeaders) > 0 {
+		if httpClient, ok := config.HTTPClient.(*http.Client); ok {
+			config.HTTPClient = secutils.WrapHTTPClientWithHeaders(httpClient, chatConfig.CustomHeaders)
+		} else {
+			// SDK 默认未显式设置时 HTTPClient 为 nil，此时构造一个新的注入了 header 的 client。
+			config.HTTPClient = secutils.WrapHTTPClientWithHeaders(nil, chatConfig.CustomHeaders)
+		}
+	}
+
+	modelName := chatConfig.ModelName
+	if chatConfig.ExtraConfig != nil {
+		if override := strings.TrimSpace(chatConfig.ExtraConfig["remote_model_name"]); override != "" {
+			modelName = override
+		}
+	}
+	if providerName == provider.ProviderWeKnoraCloud {
+		if chatConfig.AppID == "" {
+			return nil, fmt.Errorf("WeKnoraCloud provider: AppID is required")
+		}
+		if chatConfig.AppSecret == "" {
+			return nil, fmt.Errorf("WeKnoraCloud provider: AppSecret is required")
+		}
+	}
+
 	return &RemoteAPIChat{
-		modelName: chatConfig.ModelName,
-		client:    openai.NewClientWithConfig(config),
-		modelID:   chatConfig.ModelID,
-		baseURL:   chatConfig.BaseURL,
-		apiKey:    apiKey,
-		provider:  providerName,
+		modelName:        modelName,
+		client:           openai.NewClientWithConfig(config),
+		modelID:          chatConfig.ModelID,
+		baseURL:          chatConfig.BaseURL,
+		apiKey:           apiKey,
+		provider:         providerName,
+		appID:            chatConfig.AppID,
+		appSecret:        chatConfig.AppSecret,
+		customHeaders:    chatConfig.CustomHeaders,
+		adapter:          resolveProvider(providerName, modelName),
+		thinkingOverride: parseThinkingOverride(chatConfig.ExtraConfig),
 	}, nil
 }
 
-// SetRequestCustomizer 设置请求自定义器
-func (c *RemoteAPIChat) SetRequestCustomizer(customizer func(req *openai.ChatCompletionRequest, opts *ChatOptions, isStream bool) (any, bool)) {
-	c.requestCustomizer = customizer
+// authCreds bundles the credentials passed to the adapter's Auth method.
+func (c *RemoteAPIChat) authCreds() authCreds {
+	return authCreds{APIKey: c.apiKey, AppID: c.appID, AppSecret: c.appSecret}
 }
 
-// ConvertMessages 转换消息格式为 OpenAI 格式（导出供子类使用）
-func (c *RemoteAPIChat) ConvertMessages(messages []Message) []openai.ChatCompletionMessage {
-	openaiMessages := make([]openai.ChatCompletionMessage, 0, len(messages))
-	for _, msg := range messages {
-		openaiMsg := openai.ChatCompletionMessage{
-			Role: msg.Role,
-		}
-
-		if msg.Content != "" {
-			openaiMsg.Content = msg.Content
-		}
-
-		if len(msg.ToolCalls) > 0 {
-			openaiMsg.ToolCalls = make([]openai.ToolCall, 0, len(msg.ToolCalls))
-			for _, tc := range msg.ToolCalls {
-				toolType := openai.ToolType(tc.Type)
-				openaiMsg.ToolCalls = append(openaiMsg.ToolCalls, openai.ToolCall{
-					ID:   tc.ID,
-					Type: toolType,
-					Function: openai.FunctionCall{
-						Name:      tc.Function.Name,
-						Arguments: tc.Function.Arguments,
-					},
-				})
-			}
-		}
-
-		if msg.Role == "tool" {
-			openaiMsg.ToolCallID = msg.ToolCallID
-			openaiMsg.Name = msg.Name
-		}
-
-		openaiMessages = append(openaiMessages, openaiMsg)
-	}
-	return openaiMessages
-}
-
-// BuildChatCompletionRequest 构建标准聊天请求参数（导出供子类使用）
-func (c *RemoteAPIChat) BuildChatCompletionRequest(messages []Message, opts *ChatOptions, isStream bool) openai.ChatCompletionRequest {
-	req := openai.ChatCompletionRequest{
-		Model:    c.modelName,
-		Messages: c.ConvertMessages(messages),
-		Stream:   isStream,
-	}
-
-	if opts != nil {
-		if opts.Temperature > 0 {
-			req.Temperature = float32(opts.Temperature)
-		}
-		if opts.TopP > 0 {
-			req.TopP = float32(opts.TopP)
-		}
-		if opts.MaxTokens > 0 {
-			req.MaxTokens = opts.MaxTokens
-		}
-		if opts.MaxCompletionTokens > 0 {
-			req.MaxCompletionTokens = opts.MaxCompletionTokens
-		}
-		if opts.FrequencyPenalty > 0 {
-			req.FrequencyPenalty = float32(opts.FrequencyPenalty)
-		}
-		if opts.PresencePenalty > 0 {
-			req.PresencePenalty = float32(opts.PresencePenalty)
-		}
-
-		// 处理 Tools
-		if len(opts.Tools) > 0 {
-			req.Tools = make([]openai.Tool, 0, len(opts.Tools))
-			for _, tool := range opts.Tools {
-				toolType := openai.ToolType(tool.Type)
-				openaiTool := openai.Tool{
-					Type: toolType,
-					Function: &openai.FunctionDefinition{
-						Name:        tool.Function.Name,
-						Description: tool.Function.Description,
-					},
-				}
-				if tool.Function.Parameters != nil {
-					openaiTool.Function.Parameters = tool.Function.Parameters
-				}
-				req.Tools = append(req.Tools, openaiTool)
-			}
-		}
-
-		// 处理 ToolChoice（标准实现）
-		if opts.ToolChoice != "" {
-			switch opts.ToolChoice {
-			case "none", "required", "auto":
-				req.ToolChoice = opts.ToolChoice
-			default:
-				req.ToolChoice = openai.ToolChoice{
-					Type: "function",
-					Function: openai.ToolFunction{
-						Name: opts.ToolChoice,
-					},
-				}
-			}
-		}
-
-		if len(opts.Format) > 0 {
-			req.ResponseFormat = &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			}
-			req.Messages[len(req.Messages)-1].Content += fmt.Sprintf("\nUse this JSON schema: %s", opts.Format)
-		}
-	}
-
+// shapedRequest builds the standard request and applies the adapter's message
+// transform and parameter shaping (but not thinking, which may wrap the body).
+func (c *RemoteAPIChat) shapedRequest(messages []Message, opts *ChatOptions, isStream bool) openai.ChatCompletionRequest {
+	req := c.BuildChatCompletionRequest(messages, opts, isStream)
+	req.Messages = c.adapter.TransformMessages(req.Messages)
+	c.adapter.ShapeRequest(&req, opts, isStream)
 	return req
+}
+
+// buildOutbound assembles the final outbound request: the body to send, the
+// endpoint override (empty for the standard endpoint), and whether the raw HTTP
+// path is required. This is the single place that composes adapter + thinking,
+// replacing the former buildRequestCustomizer plumbing.
+func (c *RemoteAPIChat) buildOutbound(
+	messages []Message, opts *ChatOptions, isStream bool,
+) (body any, endpoint string, useRawHTTP bool, err error) {
+	req := c.shapedRequest(messages, opts, isStream)
+
+	thinking := c.thinkingOverride
+	if thinking == nil {
+		thinking = c.adapter.Thinking()
+	}
+	customBody, useRaw := thinking.Apply(&req, opts, isStream)
+
+	body = &req
+	if customBody != nil {
+		body = customBody
+	}
+	body, err = c.shapeProviderRequest(body, req, messages)
+	if err != nil {
+		return nil, "", false, err
+	}
+	endpoint = c.adapter.Endpoint(c.baseURL, c.modelID, isStream)
+	useRawHTTP = useRaw || c.adapter.ForceRawHTTP() || endpoint != ""
+	return body, endpoint, useRawHTTP, nil
 }
 
 // logRequest 记录请求日志
 func (c *RemoteAPIChat) logRequest(ctx context.Context, req any, isStream bool) {
 	if jsonData, err := json.MarshalIndent(req, "", "  "); err == nil {
-		logger.Infof(ctx, "[LLM Request] model=%s, stream=%v, request:\n%s", c.modelName, isStream, string(jsonData))
+		logger.Infof(ctx, "[LLM Request] model=%s, stream=%v, request:\n%s",
+			c.modelName, isStream, secutils.CompactImageDataURLForLog(string(jsonData)))
 	}
 }
 
 // Chat 进行非流式聊天
 func (c *RemoteAPIChat) Chat(ctx context.Context, messages []Message, opts *ChatOptions) (*types.ChatResponse, error) {
-	req := c.BuildChatCompletionRequest(messages, opts, false)
+	// 仅在调用方未设置 deadline 时附加一个兜底超时，防止 hung 请求永久阻塞 worker；
+	// 调用方若显式设置了更短或更长的 deadline，都会被原样尊重。
+	timeoutCtx, cancel := withLLMTimeout(ctx, defaultChatTimeout)
+	defer cancel()
 
-	// 检查是否需要自定义请求
-	if c.requestCustomizer != nil {
-		customReq, useRawHTTP := c.requestCustomizer(&req, opts, false)
-		if useRawHTTP && customReq != nil {
-			return c.chatWithRawHTTP(ctx, customReq)
+	body, endpoint, useRawHTTP, err := c.buildOutbound(messages, opts, false)
+	if err != nil {
+		return nil, err
+	}
+	if useRawHTTP {
+		return c.chatWithRawHTTP(timeoutCtx, endpoint, body)
+	}
+
+	req := *(body.(*openai.ChatCompletionRequest))
+	c.logRequest(timeoutCtx, req, false)
+	resp, err := c.client.CreateChatCompletion(timeoutCtx, req)
+	if err != nil {
+		if isMultimodalNotSupportedError(err) {
+			logger.Warnf(timeoutCtx, "[LLM Request] Model %s does not support multimodal, retrying without images", c.modelName)
+			cleaned := stripImagesFromMessages(messages)
+			req = c.shapedRequest(cleaned, opts, false)
+			resp, err = c.client.CreateChatCompletion(timeoutCtx, req)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("create chat completion: %w", err)
 		}
 	}
 
-	c.logRequest(ctx, req, false)
-
-	resp, err := c.client.CreateChatCompletion(ctx, req)
+	result, err := c.parseCompletionResponse(&resp)
 	if err != nil {
-		return nil, fmt.Errorf("create chat completion: %w", err)
+		return nil, err
 	}
-
-	return c.parseCompletionResponse(&resp)
+	logUsage(timeoutCtx, c.modelName, &result.Usage)
+	return result, nil
 }
 
 // chatWithRawHTTP 使用原始 HTTP 请求进行聊天（供自定义请求使用）
-func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, customReq any) (*types.ChatResponse, error) {
+func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, customReq any) (*types.ChatResponse, error) {
 	jsonData, err := json.Marshal(customReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	logger.Infof(ctx, "[LLM Request] model=%s, raw HTTP request:\n%s", c.modelName, string(jsonData))
+	if endpoint == "" {
+		endpoint = c.baseURL + "/chat/completions"
+	}
+	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("endpoint SSRF check failed: %w", err)
+	}
+	logger.Infof(ctx, "[LLM Request] Remote HTTP, endpoint=%s, model=%s, raw HTTP request:\n%s",
+		endpoint, c.modelName, secutils.CompactImageDataURLForLog(string(jsonData)))
 
-	endpoint := c.baseURL + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	c.adapter.Auth(httpReq, c.authCreds(), jsonData)
 
-	client := &http.Client{}
-	resp, err := client.Do(httpReq)
+	// 注入用户自定义 header（保留头会在工具内部自动跳过）
+	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
+
+	logger.Infof(ctx, "[LLM Request] Remote HTTP, endpoint=%s, model=%s",
+		endpoint, c.modelName)
+
+	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
@@ -227,127 +240,128 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, customReq any) (*ty
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
 	var chatResp openai.ChatCompletionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+	if err := json.Unmarshal(body, &chatResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	return c.parseCompletionResponse(&chatResp)
-}
-
-// parseCompletionResponse 解析非流式响应
-func (c *RemoteAPIChat) parseCompletionResponse(resp *openai.ChatCompletionResponse) (*types.ChatResponse, error) {
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("no response from API")
+	result, err := c.parseCompletionResponse(&chatResp)
+	if err != nil {
+		return nil, err
 	}
-
-	choice := resp.Choices[0]
-
-	// 处理思考模型的输出：移除 <think></think> 标签包裹的思考过程
-	// 为设置了 Thinking=false 但模型仍返回思考内容的情况和部分不支持Thinking=false的思考模型(例如Miniax-M2.1)提供兜底策略
-	content := removeThinkingContent(choice.Message.Content)
-
-	response := &types.ChatResponse{
-		Content:      content,
-		FinishReason: string(choice.FinishReason),
-		Usage: struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		}{
-			PromptTokens:     resp.Usage.PromptTokens,
-			CompletionTokens: resp.Usage.CompletionTokens,
-			TotalTokens:      resp.Usage.TotalTokens,
-		},
-	}
-
-	if len(choice.Message.ToolCalls) > 0 {
-		response.ToolCalls = make([]types.LLMToolCall, 0, len(choice.Message.ToolCalls))
-		for _, tc := range choice.Message.ToolCalls {
-			response.ToolCalls = append(response.ToolCalls, types.LLMToolCall{
-				ID:   tc.ID,
-				Type: string(tc.Type),
-				Function: types.FunctionCall{
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
-				},
-			})
-		}
-	}
-
-	return response, nil
-}
-
-// removeThinkingContent 移除思考模型输出中的 <think></think> 思考过程
-// 仅当内容以 <think> 开头时才处理
-func removeThinkingContent(content string) string {
-	const thinkStartTag = "<think>"
-	const thinkEndTag = "</think>"
-
-	trimmed := strings.TrimSpace(content)
-	if !strings.HasPrefix(trimmed, thinkStartTag) {
-		return content
-	}
-
-	// 查找最后一个 </think> 标签（处理嵌套情况）
-	if lastEndIdx := strings.LastIndex(trimmed, thinkEndTag); lastEndIdx != -1 {
-		if result := strings.TrimSpace(trimmed[lastEndIdx+len(thinkEndTag):]); result != "" {
-			return result
-		}
-		return ""
-	}
-
-	return "" // 未找到 </think>，可能思考内容过长被截断，返回空字符串
+	c.applyCompletionToolCallMetadata(body, result)
+	logUsage(ctx, c.modelName, &result.Usage)
+	return result, nil
 }
 
 // ChatStream 进行流式聊天
 func (c *RemoteAPIChat) ChatStream(ctx context.Context, messages []Message, opts *ChatOptions) (<-chan types.StreamResponse, error) {
-	req := c.BuildChatCompletionRequest(messages, opts, true)
+	// 仅在调用方未设置 deadline 时附加兜底超时；流式调用默认超时更长，
+	// 因为带思考/推理的模型可能数十秒甚至几分钟才产出首 token。
+	timeoutCtx, cancel := withLLMTimeout(ctx, defaultStreamTimeout)
 
-	// 检查是否需要自定义请求
-	if c.requestCustomizer != nil {
-		customReq, useRawHTTP := c.requestCustomizer(&req, opts, true)
-		if useRawHTTP && customReq != nil {
-			return c.chatStreamWithRawHTTP(ctx, customReq)
-		}
+	body, endpoint, useRawHTTP, err := c.buildOutbound(messages, opts, true)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if useRawHTTP {
+		ch, err := c.chatStreamWithRawHTTP(timeoutCtx, endpoint, body)
+		return wrapStreamCancel(ch, err, cancel)
 	}
 
-	c.logRequest(ctx, req, true)
+	req := *(body.(*openai.ChatCompletionRequest))
+	c.logRequest(timeoutCtx, req, true)
+
+	streamDumper := newStreamPacketDumper(c.modelName, &req)
+	if streamDumper != nil {
+		logger.Infof(timeoutCtx, "[LLM Stream Raw Dump] writing packets to %s", streamDumper.Path())
+	}
 
 	streamChan := make(chan types.StreamResponse)
 
-	stream, err := c.client.CreateChatCompletionStream(ctx, req)
+	stream, err := c.client.CreateChatCompletionStream(timeoutCtx, req)
 	if err != nil {
-		close(streamChan)
-		return nil, fmt.Errorf("create chat completion stream: %w", err)
+		if isMultimodalNotSupportedError(err) {
+			logger.Warnf(timeoutCtx, "[LLM Stream] Model %s does not support multimodal, retrying without images", c.modelName)
+			cleaned := stripImagesFromMessages(messages)
+			req = c.shapedRequest(cleaned, opts, true)
+			stream, err = c.client.CreateChatCompletionStream(timeoutCtx, req)
+		}
+		if err != nil {
+			cancel()
+			close(streamChan)
+			return nil, fmt.Errorf("create chat completion stream: %w", err)
+		}
 	}
 
-	go c.processStream(ctx, stream, streamChan)
+	go func() {
+		defer cancel()
+		if streamDumper != nil {
+			defer streamDumper.Close()
+		}
+		c.processStream(timeoutCtx, stream, streamChan, streamDumper)
+	}()
 
 	return streamChan, nil
 }
 
+// wrapStreamCancel 在子 channel 关闭后执行 cancel，避免 timeout context 泄漏。
+// 当底层调用直接返回 error 时，立即调用 cancel 并将 error 透出。
+func wrapStreamCancel(in <-chan types.StreamResponse, err error, cancel context.CancelFunc) (<-chan types.StreamResponse, error) {
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	out := make(chan types.StreamResponse)
+	go func() {
+		defer cancel()
+		defer close(out)
+		for v := range in {
+			out <- v
+		}
+	}()
+	return out, nil
+}
+
 // chatStreamWithRawHTTP 使用原始 HTTP 请求进行流式聊天
-func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, customReq any) (<-chan types.StreamResponse, error) {
+func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint string, customReq any) (<-chan types.StreamResponse, error) {
 	jsonData, err := json.Marshal(customReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	logger.Infof(ctx, "[LLM Stream] model=%s", c.modelName)
+	if endpoint == "" {
+		endpoint = c.baseURL + "/chat/completions"
+	}
+	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("endpoint SSRF check failed: %w", err)
+	}
 
-	endpoint := c.baseURL + "/chat/completions"
+	if prettyJSON, pErr := json.MarshalIndent(customReq, "", "  "); pErr == nil {
+		logger.Infof(ctx, "[LLM Stream Request] endpoint=%s, model=%s, stream=true, request:\n%s",
+			endpoint, c.modelName, secutils.CompactImageDataURLForLog(string(prettyJSON)))
+	} else {
+		logger.Infof(ctx, "[LLM Stream] endpoint=%s, model=%s", endpoint, c.modelName)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	c.adapter.Auth(httpReq, c.authCreds(), jsonData)
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	client := &http.Client{}
-	resp, err := client.Do(httpReq)
+	// 注入用户自定义 header（保留头会在工具内部自动跳过）
+	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
+
+	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
@@ -359,278 +373,19 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, customReq any
 	}
 
 	streamChan := make(chan types.StreamResponse)
+	streamDumper := newStreamPacketDumper(c.modelName, customReq)
+	if streamDumper != nil {
+		logger.Infof(ctx, "[LLM Stream Raw Dump] writing packets to %s", streamDumper.Path())
+	}
 
-	go c.processRawHTTPStream(ctx, resp, streamChan)
+	go func() {
+		if streamDumper != nil {
+			defer streamDumper.Close()
+		}
+		c.processRawHTTPStream(ctx, resp, streamChan, streamDumper)
+	}()
 
 	return streamChan, nil
-}
-
-// processStream 处理 OpenAI SDK 流式响应
-func (c *RemoteAPIChat) processStream(ctx context.Context, stream *openai.ChatCompletionStream, streamChan chan types.StreamResponse) {
-	defer close(streamChan)
-	defer stream.Close()
-
-	state := newStreamState()
-
-	for {
-		response, err := stream.Recv()
-		if err != nil {
-			if err.Error() == "EOF" {
-				streamChan <- types.StreamResponse{
-					ResponseType: types.ResponseTypeAnswer,
-					Content:      "",
-					Done:         true,
-					ToolCalls:    state.buildOrderedToolCalls(),
-				}
-			} else {
-				streamChan <- types.StreamResponse{
-					ResponseType: types.ResponseTypeError,
-					Content:      err.Error(),
-					Done:         true,
-				}
-			}
-			return
-		}
-
-		if len(response.Choices) > 0 {
-			c.processStreamDelta(ctx, &response.Choices[0], state, streamChan)
-		}
-	}
-}
-
-// processRawHTTPStream 处理原始 HTTP 流式响应
-func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Response, streamChan chan types.StreamResponse) {
-	defer close(streamChan)
-	defer resp.Body.Close()
-
-	state := newStreamState()
-	reader := NewSSEReader(resp.Body)
-
-	for {
-		event, err := reader.ReadEvent()
-		if err != nil {
-			if err.Error() != "EOF" {
-				logger.Errorf(ctx, "Stream read error: %v", err)
-				streamChan <- types.StreamResponse{
-					ResponseType: types.ResponseTypeError,
-					Content:      err.Error(),
-					Done:         true,
-				}
-			}
-			return
-		}
-
-		if event == nil {
-			continue
-		}
-
-		if event.Done {
-			streamChan <- types.StreamResponse{
-				ResponseType: types.ResponseTypeAnswer,
-				Content:      "",
-				Done:         true,
-				ToolCalls:    state.buildOrderedToolCalls(),
-			}
-			return
-		}
-
-		if event.Data == nil {
-			continue
-		}
-
-		var streamResp openai.ChatCompletionStreamResponse
-		if err := json.Unmarshal(event.Data, &streamResp); err != nil {
-			logger.Errorf(ctx, "Failed to parse stream response: %v", err)
-			continue
-		}
-
-		if len(streamResp.Choices) > 0 {
-			c.processStreamDelta(ctx, &streamResp.Choices[0], state, streamChan)
-		}
-	}
-}
-
-// streamState 流式处理状态
-type streamState struct {
-	toolCallMap      map[int]*types.LLMToolCall
-	lastFunctionName map[int]string
-	nameNotified     map[int]bool
-	hasThinking      bool
-	fieldExtractors  map[int]*jsonFieldExtractor // per tool-call-index extractors for streaming field extraction
-}
-
-func newStreamState() *streamState {
-	return &streamState{
-		toolCallMap:      make(map[int]*types.LLMToolCall),
-		lastFunctionName: make(map[int]string),
-		nameNotified:     make(map[int]bool),
-		hasThinking:      false,
-		fieldExtractors:  make(map[int]*jsonFieldExtractor),
-	}
-}
-
-func (s *streamState) buildOrderedToolCalls() []types.LLMToolCall {
-	if len(s.toolCallMap) == 0 {
-		return nil
-	}
-	result := make([]types.LLMToolCall, 0, len(s.toolCallMap))
-	for i := 0; i < len(s.toolCallMap); i++ {
-		if tc, ok := s.toolCallMap[i]; ok && tc != nil {
-			result = append(result, *tc)
-		}
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
-}
-
-// processStreamDelta 处理流式响应的单个 delta
-func (c *RemoteAPIChat) processStreamDelta(ctx context.Context, choice *openai.ChatCompletionStreamChoice, state *streamState, streamChan chan types.StreamResponse) {
-	delta := choice.Delta
-	isDone := string(choice.FinishReason) != ""
-
-	// 处理 tool calls
-	if len(delta.ToolCalls) > 0 {
-		c.processToolCallsDelta(delta.ToolCalls, state, streamChan)
-	}
-
-	// 发送思考内容（ReasoningContent，支持 DeepSeek 等模型）
-	if delta.ReasoningContent != "" {
-		state.hasThinking = true
-		streamChan <- types.StreamResponse{
-			ResponseType: types.ResponseTypeThinking,
-			Content:      delta.ReasoningContent,
-			Done:         false,
-		}
-	}
-
-	// 发送回答内容
-	if delta.Content != "" {
-		// If we had thinking content and this is the first answer chunk,
-		// send a thinking done event first
-		if state.hasThinking {
-			streamChan <- types.StreamResponse{
-				ResponseType: types.ResponseTypeThinking,
-				Content:      "",
-				Done:         true,
-			}
-			state.hasThinking = false // Only send once
-		}
-		streamChan <- types.StreamResponse{
-			ResponseType: types.ResponseTypeAnswer,
-			Content:      delta.Content,
-			Done:         isDone,
-			ToolCalls:    state.buildOrderedToolCalls(),
-		}
-	}
-
-	if isDone && len(state.toolCallMap) > 0 {
-		streamChan <- types.StreamResponse{
-			ResponseType: types.ResponseTypeAnswer,
-			Content:      "",
-			Done:         true,
-			ToolCalls:    state.buildOrderedToolCalls(),
-		}
-	}
-}
-
-// processToolCallsDelta 处理 tool calls 的增量更新
-func (c *RemoteAPIChat) processToolCallsDelta(toolCalls []openai.ToolCall, state *streamState, streamChan chan types.StreamResponse) {
-	for _, tc := range toolCalls {
-		var toolCallIndex int
-		if tc.Index != nil {
-			toolCallIndex = *tc.Index
-		}
-		toolCallEntry, exists := state.toolCallMap[toolCallIndex]
-		if !exists || toolCallEntry == nil {
-			toolCallEntry = &types.LLMToolCall{
-				Type: string(tc.Type),
-				Function: types.FunctionCall{
-					Name:      "",
-					Arguments: "",
-				},
-			}
-			state.toolCallMap[toolCallIndex] = toolCallEntry
-		}
-
-		if tc.ID != "" {
-			toolCallEntry.ID = tc.ID
-		}
-		if tc.Type != "" {
-			toolCallEntry.Type = string(tc.Type)
-		}
-		if tc.Function.Name != "" {
-			toolCallEntry.Function.Name += tc.Function.Name
-		}
-
-		argsUpdated := false
-		if tc.Function.Arguments != "" {
-			toolCallEntry.Function.Arguments += tc.Function.Arguments
-			argsUpdated = true
-		}
-
-		currName := toolCallEntry.Function.Name
-		if currName != "" &&
-			currName == state.lastFunctionName[toolCallIndex] &&
-			argsUpdated &&
-			!state.nameNotified[toolCallIndex] &&
-			toolCallEntry.ID != "" {
-			streamChan <- types.StreamResponse{
-				ResponseType: types.ResponseTypeToolCall,
-				Content:      "",
-				Done:         false,
-				Data: map[string]interface{}{
-					"tool_name":    currName,
-					"tool_call_id": toolCallEntry.ID,
-				},
-			}
-			state.nameNotified[toolCallIndex] = true
-		}
-
-		state.lastFunctionName[toolCallIndex] = currName
-
-		// Stream final_answer tool arguments as answer-type chunks
-		if toolCallEntry.Function.Name == "final_answer" && argsUpdated {
-			extractor, exists := state.fieldExtractors[toolCallIndex]
-			if !exists {
-				extractor = newJSONFieldExtractor("answer")
-				state.fieldExtractors[toolCallIndex] = extractor
-			}
-			answerChunk := extractor.Feed(tc.Function.Arguments)
-			if answerChunk != "" {
-				streamChan <- types.StreamResponse{
-					ResponseType: types.ResponseTypeAnswer,
-					Content:      answerChunk,
-					Done:         false,
-					Data: map[string]interface{}{
-						"source": "final_answer_tool",
-					},
-				}
-			}
-		}
-
-		// Stream thinking tool's thought field as thinking-type chunks
-		if toolCallEntry.Function.Name == "thinking" && argsUpdated {
-			extractor, exists := state.fieldExtractors[toolCallIndex]
-			if !exists {
-				extractor = newJSONFieldExtractor("thought")
-				state.fieldExtractors[toolCallIndex] = extractor
-			}
-			thoughtChunk := extractor.Feed(tc.Function.Arguments)
-			if thoughtChunk != "" {
-				streamChan <- types.StreamResponse{
-					ResponseType: types.ResponseTypeThinking,
-					Content:      thoughtChunk,
-					Done:         false,
-					Data: map[string]interface{}{
-						"source":       "thinking_tool",
-						"tool_call_id": toolCallEntry.ID,
-					},
-				}
-			}
-		}
-	}
 }
 
 // GetModelName 获取模型名称

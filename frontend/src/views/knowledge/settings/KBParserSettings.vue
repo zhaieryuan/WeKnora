@@ -1,6 +1,6 @@
 <template>
-  <div class="kb-parser-settings">
-    <div class="section-header">
+  <div class="kb-parser-settings" :class="{ 'kb-parser-settings--embedded': embedded }">
+    <div v-if="!embedded" class="section-header">
       <h2>{{ $t('kbSettings.parser.title') }}</h2>
       <p class="section-description">{{ $t('kbSettings.parser.description') }}</p>
     </div>
@@ -33,7 +33,7 @@
           <t-select
             :value="getEngineForGroup(group.extensions) || undefined"
             @change="(val: string) => handleEngineChange(group.extensions, val)"
-            style="width: 280px;"
+            :style="embedded ? { width: '100%' } : { width: '280px' }"
             :status="hasAvailableEngine(group.extensions) ? 'default' : 'warning'"
             :placeholder="$t('kbSettings.parser.noEngine')"
           >
@@ -86,11 +86,13 @@
 <script setup lang="ts">
 import { ref, watch, computed, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getParserEngines, type ParserEngineInfo } from '@/api/system'
+import { type ParserEngineInfo } from '@/api/system'
+import { useEditorResourcesStore } from '@/stores/editorResources'
 import { useUIStore } from '@/stores/ui'
 import { storeToRefs } from 'pinia'
 
 const { t } = useI18n()
+const editorResources = useEditorResourcesStore()
 
 function getEngineDisplayName(engineName: string): string {
   const key = `kbSettings.parser.engines.${engineName}.name`
@@ -121,10 +123,16 @@ interface EngineOption {
 
 interface Props {
   parserEngineRules?: ParserEngineRule[]
+  /** Compact layout for upload-confirm dialog */
+  embedded?: boolean
+  /** When set, only show file-type groups matching these extensions */
+  relevantExtensions?: string[]
 }
 
 const props = withDefaults(defineProps<Props>(), {
-  parserEngineRules: () => []
+  parserEngineRules: () => [],
+  embedded: false,
+  relevantExtensions: () => [],
 })
 
 const emit = defineEmits<{
@@ -154,21 +162,41 @@ const fileTypeGroups = computed(() => {
   const officeExts = ['docx', 'doc'].filter(e => ft.has(e))
   const pptExts = ['pptx', 'ppt'].filter(e => ft.has(e))
   const excelExts = ['xlsx', 'xls'].filter(e => ft.has(e))
+  const ebookExts = ['epub'].filter(e => ft.has(e))
+  const webArchiveExts = ['mhtml'].filter(e => ft.has(e))
   const csvExts = ['csv'].filter(e => ft.has(e))
   const mdExts = ['md', 'markdown'].filter(e => ft.has(e))
   const txtExts = ['txt'].filter(e => ft.has(e))
+  const jsonExts = ['json'].filter(e => ft.has(e))
   const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'webp'].filter(e => ft.has(e))
+  const audioExts = ['mp3', 'wav', 'm4a', 'flac', 'ogg'].filter(e => ft.has(e))
+  const audiovisualExts = [...audioExts]
 
   if (pdfExts.length) groups.push({ key: 'pdf', label: t('kbSettings.parser.fileTypePdf'), icon: 'file-pdf', extensions: pdfExts })
   if (officeExts.length) groups.push({ key: 'office', label: t('kbSettings.parser.fileTypeWord'), icon: 'file-word', extensions: officeExts })
   if (pptExts.length) groups.push({ key: 'ppt', label: t('kbSettings.parser.fileTypePpt'), icon: 'file-powerpoint', extensions: pptExts })
   if (excelExts.length) groups.push({ key: 'excel', label: t('kbSettings.parser.fileTypeExcel'), icon: 'file-excel', extensions: excelExts })
+  if (ebookExts.length) groups.push({ key: 'ebook', label: t('kbSettings.parser.fileTypeEbook'), icon: 'file', extensions: ebookExts })
+  if (webArchiveExts.length) groups.push({ key: 'webarchive', label: t('kbSettings.parser.fileTypeWebArchive'), icon: 'file', extensions: webArchiveExts })
   if (csvExts.length) groups.push({ key: 'csv', label: t('kbSettings.parser.fileTypeCsv'), icon: 'file-excel', extensions: csvExts })
   if (mdExts.length) groups.push({ key: 'markdown', label: 'Markdown', icon: 'file-code', extensions: mdExts })
   if (txtExts.length) groups.push({ key: 'text', label: t('kbSettings.parser.fileTypeText'), icon: 'file', extensions: txtExts })
+  if (jsonExts.length) groups.push({ key: 'json', label: t('kbSettings.parser.fileTypeJson'), icon: 'file-code', extensions: jsonExts })
   if (imageExts.length) groups.push({ key: 'image', label: t('kbSettings.parser.fileTypeImage'), icon: 'image', extensions: imageExts })
+  if (audiovisualExts.length) {
+    groups.push({
+      key: 'audiovisual',
+      label: t('kbSettings.parser.fileTypeAudiovisual'),
+      icon: 'sound',
+      extensions: audiovisualExts,
+    })
+  }
 
-  return groups
+  const rel = props.relevantExtensions
+  if (!rel?.length) return groups
+  const relSet = new Set(rel)
+  const filtered = groups.filter(g => g.extensions.some(e => relSet.has(e)))
+  return filtered.length > 0 ? filtered : groups
 })
 
 function getEngineOptions(extensions: string[]): EngineOption[] {
@@ -241,13 +269,11 @@ function goToParserSettings() {
   uiStore.openSettings('parser')
 }
 
-async function loadEngines() {
+async function loadEngines(force = false) {
   loading.value = true
   try {
-    const resp = await getParserEngines()
-    if (resp?.data && Array.isArray(resp.data)) {
-      parserEngines.value = resp.data
-    }
+    await editorResources.ensureParserEngines(force)
+    parserEngines.value = editorResources.parserEngines as ParserEngineInfo[]
   } catch {
     parserEngines.value = []
   } finally {
@@ -270,7 +296,7 @@ onMounted(loadEngines)
 const { showSettingsModal } = storeToRefs(uiStore)
 watch(showSettingsModal, (open, wasOpen) => {
   if (wasOpen && !open) {
-    loadEngines()
+    loadEngines(true)
   }
 })
 
@@ -285,13 +311,13 @@ watch(() => props.parserEngineRules, (v) => {
 }
 
 .section-header {
-  margin-bottom: 32px;
+  margin-bottom: 20px;
 
   h2 {
     font-size: 20px;
     font-weight: 600;
     color: var(--td-text-color-primary);
-    margin: 0 0 8px 0;
+    margin: 0 0 6px 0;
   }
 
   .section-description {
@@ -324,7 +350,7 @@ watch(() => props.parserEngineRules, (v) => {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  padding: 20px 0;
+  padding: 16px 0;
   border-bottom: 1px solid var(--td-component-stroke);
 
   &:last-child {
@@ -333,8 +359,8 @@ watch(() => props.parserEngineRules, (v) => {
 }
 
 .setting-info {
-  flex: 1;
-  max-width: 65%;
+  flex: 0 0 40%;
+  max-width: 40%;
   padding-right: 24px;
 
   .group-label {
@@ -372,7 +398,7 @@ watch(() => props.parserEngineRules, (v) => {
     background: var(--td-bg-color-secondarycontainer);
     padding: 3px 8px;
     border-radius: 4px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-family: var(--app-font-family-mono);
   }
 
   .desc {
@@ -384,8 +410,8 @@ watch(() => props.parserEngineRules, (v) => {
 }
 
 .setting-control {
-  flex-shrink: 0;
-  min-width: 280px;
+  flex: 0 0 55%;
+  max-width: 55%;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -430,7 +456,7 @@ watch(() => props.parserEngineRules, (v) => {
   font-size: 13px;
   font-weight: 600;
   color: var(--td-text-color-primary);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--app-font-family-mono);
 }
 
 .engine-option-desc {
@@ -454,6 +480,46 @@ watch(() => props.parserEngineRules, (v) => {
     &:hover {
       text-decoration: underline;
     }
+  }
+}
+
+.kb-parser-settings--embedded {
+  .setting-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px 0;
+  }
+
+  .setting-info {
+    flex: none;
+    max-width: none;
+    padding-right: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 10px;
+  }
+
+  .setting-control {
+    flex: none;
+    max-width: none;
+    align-items: stretch;
+  }
+
+  .group-label {
+    font-size: 14px;
+    margin-bottom: 0;
+  }
+
+  .ext-tags {
+    margin-top: 0;
+    gap: 4px;
+  }
+
+  .ext-tag {
+    font-size: 11px;
+    padding: 2px 6px;
   }
 }
 </style>

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,7 +30,7 @@ type s3FileService struct {
 }
 
 // newS3Client creates a bare s3FileService with just the SDK client initialised.
-func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix string) (*s3FileService, error) {
+func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix string, forcePathStyle bool) (*s3FileService, error) {
 	var cfg aws.Config
 	var err error
 
@@ -43,11 +44,16 @@ func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix 
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// Create S3 client with custom endpoint if provided
+	// Create S3 client with custom endpoint if provided.
+	// For S3-compatible services (non-AWS), use path-style addressing
+	// (endpoint/bucket/key) instead of virtual-hosted style (bucket.endpoint/key).
 	var client *s3.Client
 	if endpoint != "" {
-		// Use S3-specific endpoint resolver for custom endpoints
-		client = s3.NewFromConfig(cfg, s3.WithEndpointResolver(s3.EndpointResolverFromURL(endpoint)))
+		usePathStyle := forcePathStyle || !strings.Contains(endpoint, "amazonaws.com")
+		client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(endpoint)
+			o.UsePathStyle = usePathStyle
+		})
 	} else {
 		// Standard AWS S3
 		client = s3.NewFromConfig(cfg)
@@ -70,7 +76,7 @@ func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix 
 func NewS3FileService(endpoint,
 	accessKey, secretKey, bucketName, region, pathPrefix string,
 ) (interfaces.FileService, error) {
-	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix)
+	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix, false)
 	if err != nil {
 		return nil, err
 	}
@@ -87,6 +93,25 @@ func NewS3FileService(endpoint,
 		}
 	}
 
+	return svc, nil
+}
+
+// NewS3FileServiceWithOptions is the instance-aware S3 constructor. Existing
+// callers keep the historical endpoint-based path-style inference.
+func NewS3FileServiceWithOptions(endpoint, accessKey, secretKey, bucketName, region, pathPrefix string, forcePathStyle bool) (interfaces.FileService, error) {
+	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix, forcePathStyle)
+	if err != nil {
+		return nil, err
+	}
+	exists, err := svc.bucketExists(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to check bucket: %w", err)
+	}
+	if !exists {
+		if err = svc.createBucket(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to create bucket: %w", err)
+		}
+	}
 	return svc, nil
 }
 
@@ -139,7 +164,11 @@ func (s *s3FileService) CheckConnectivity(ctx context.Context) error {
 // CheckS3Connectivity tests S3 connectivity using the provided credentials.
 // It creates a temporary service instance internally and delegates to CheckConnectivity.
 func CheckS3Connectivity(ctx context.Context, endpoint, accessKey, secretKey, bucketName, region string) error {
-	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, "")
+	return CheckS3ConnectivityWithOptions(ctx, endpoint, accessKey, secretKey, bucketName, region, false)
+}
+
+func CheckS3ConnectivityWithOptions(ctx context.Context, endpoint, accessKey, secretKey, bucketName, region string, forcePathStyle bool) error {
+	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, "", forcePathStyle)
 	if err != nil {
 		return err
 	}
@@ -167,50 +196,6 @@ func (s *s3FileService) parseS3FilePath(filePath string) (string, error) {
 	return parts[1], nil
 }
 
-// getContentTypeByExt returns the content type based on file extension
-func getContentTypeByExt(ext string) string {
-	switch strings.ToLower(ext) {
-	case ".csv":
-		return "text/csv; charset=utf-8"
-	case ".json":
-		return "application/json"
-	case ".pdf":
-		return "application/pdf"
-	case ".doc":
-		return "application/msword"
-	case ".docx":
-		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-	case ".xls":
-		return "application/vnd.ms-excel"
-	case ".xlsx":
-		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-	case ".ppt":
-		return "application/vnd.ms-powerpoint"
-	case ".pptx":
-		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-	case ".txt":
-		return "text/plain; charset=utf-8"
-	case ".md":
-		return "text/markdown"
-	case ".html":
-		return "text/html; charset=utf-8"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".svg":
-		return "image/svg+xml"
-	case ".mp3":
-		return "audio/mpeg"
-	case ".mp4":
-		return "video/mp4"
-	default:
-		return "application/octet-stream"
-	}
-}
-
 // SaveFile saves a file to S3
 func (s *s3FileService) SaveFile(ctx context.Context,
 	file *multipart.FileHeader, tenantID uint64, knowledgeID string,
@@ -229,7 +214,7 @@ func (s *s3FileService) SaveFile(ctx context.Context,
 	// Determine content type
 	contentType := file.Header.Get("Content-Type")
 	if contentType == "" {
-		contentType = getContentTypeByExt(ext)
+		contentType = utils.GetContentTypeByExt(ext)
 	}
 
 	// Upload file to S3
@@ -283,6 +268,37 @@ func (s *s3FileService) DeleteFile(ctx context.Context, filePath string) error {
 	return nil
 }
 
+// CopyFile copies an existing S3 object to a new knowledge-owned object using a
+// server-side CopyObject (no data leaves S3). The destination uses the same
+// layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not an s3:// path.
+func (s *s3FileService) CopyFile(ctx context.Context,
+	srcPath string, tenantID uint64, knowledgeID string,
+) (string, error) {
+	srcKey, err := s.parseS3FilePath(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("s3 copy rejected source %q: %w", srcPath, ErrCrossBackendCopy)
+	}
+
+	ext := filepath.Ext(srcPath)
+	destKey := fmt.Sprintf("%s%d/%s/%s%s", s.pathPrefix, tenantID, knowledgeID, uuid.New().String(), ext)
+
+	// CopySource is "bucket/key"; the '/' separators must NOT be percent-encoded
+	// (url.PathEscape would turn them into %2F and break the bucket/key split).
+	// srcKey is already validated by parseS3FilePath -> SafeObjectKey.
+	_, err = s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucketName),
+		CopySource: aws.String(s.bucketName + "/" + srcKey),
+		Key:        aws.String(destKey),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to copy file in S3: %w", err)
+	}
+
+	newPath := fmt.Sprintf("s3://%s/%s", s.bucketName, destKey)
+	logger.Infof(ctx, "Copied S3 object %s to %s", srcPath, newPath)
+	return newPath, nil
+}
+
 // SaveBytes saves bytes data to S3 and returns the file path
 // temp parameter is ignored for S3 (no auto-expiration support in this implementation)
 func (s *s3FileService) SaveBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
@@ -300,7 +316,7 @@ func (s *s3FileService) SaveBytes(ctx context.Context, data []byte, tenantID uin
 		Key:           aws.String(objectName),
 		Body:          reader,
 		ContentLength: aws.Int64(int64(len(data))),
-		ContentType:   aws.String("text/csv; charset=utf-8"),
+		ContentType:   aws.String(utils.GetContentTypeByExt(ext)),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload bytes to S3: %w", err)

@@ -18,6 +18,9 @@ type SystemInfo struct {
 	GraphDatabaseEngine string `json:"graph_database_engine,omitempty"`
 	MinioEnabled        bool   `json:"minio_enabled,omitempty"`
 	DBVersion           string `json:"db_version,omitempty"`
+	DBMigrationError    string `json:"db_migration_error,omitempty"`
+	StartedAt           string `json:"started_at,omitempty"`
+	UptimeSeconds       int64  `json:"uptime_seconds,omitempty"`
 }
 
 // ParserEngine represents a document parser engine
@@ -31,6 +34,7 @@ type ParserEngine struct {
 // StorageEngineStatusItem describes one storage engine's availability
 type StorageEngineStatusItem struct {
 	Name        string `json:"name"`
+	Allowed     bool   `json:"allowed"`
 	Available   bool   `json:"available"`
 	Description string `json:"description"`
 }
@@ -38,6 +42,7 @@ type StorageEngineStatusItem struct {
 // StorageEngineStatusResponse is the response for storage engine status
 type StorageEngineStatusResponse struct {
 	Engines           []StorageEngineStatusItem `json:"engines"`
+	AllowedProviders  []string                  `json:"allowed_providers"`
 	MinioEnvAvailable bool                      `json:"minio_env_available"`
 }
 
@@ -48,6 +53,7 @@ type StorageCheckRequest struct {
 	COS      json.RawMessage `json:"cos,omitempty"`
 	TOS      json.RawMessage `json:"tos,omitempty"`
 	S3       json.RawMessage `json:"s3,omitempty"`
+	OBS      json.RawMessage `json:"obs,omitempty"`
 }
 
 // StorageCheckResponse is the response for storage engine check
@@ -55,13 +61,6 @@ type StorageCheckResponse struct {
 	OK            bool   `json:"ok"`
 	Message       string `json:"message"`
 	BucketCreated bool   `json:"bucket_created,omitempty"`
-}
-
-// MinioBucketInfo represents MinIO bucket information
-type MinioBucketInfo struct {
-	Name      string `json:"name"`
-	Policy    string `json:"policy"`
-	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // GetSystemInfo gets system version and configuration information
@@ -153,22 +152,4 @@ func (c *Client) CheckStorageEngine(ctx context.Context, req *StorageCheckReques
 		return nil, err
 	}
 	return result.Data, nil
-}
-
-// ListMinioBuckets lists all MinIO buckets with their access policies
-func (c *Client) ListMinioBuckets(ctx context.Context) ([]MinioBucketInfo, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, "/api/v1/system/minio/buckets", nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	var result struct {
-		Code int `json:"code"`
-		Data struct {
-			Buckets []MinioBucketInfo `json:"buckets"`
-		} `json:"data"`
-	}
-	if err := parseResponse(resp, &result); err != nil {
-		return nil, err
-	}
-	return result.Data.Buckets, nil
 }

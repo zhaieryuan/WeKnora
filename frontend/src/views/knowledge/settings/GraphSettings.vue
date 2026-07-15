@@ -1,10 +1,9 @@
 <template>
-  <div class="graph-settings">
-    <div class="section-header">
+  <div class="graph-settings" :class="{ 'graph-settings--embedded': embedded }">
+    <div v-if="!embedded" class="section-header">
       <h2>{{ t('graphSettings.title') }}</h2>
       <p class="section-description">{{ t('graphSettings.description') }}</p>
-      
-      <!-- Warning message when graph database is not enabled -->
+
       <t-alert
         v-if="!isGraphDatabaseEnabled"
         theme="warning"
@@ -18,6 +17,15 @@
         </template>
       </t-alert>
     </div>
+    <t-alert
+      v-else-if="!isGraphDatabaseEnabled"
+      theme="warning"
+      class="embedded-graph-alert"
+    >
+      <template #message>
+        <div>{{ t('graphSettings.disabledWarning') }}</div>
+      </template>
+    </t-alert>
 
     <div v-if="isGraphDatabaseEnabled" class="settings-group">
       <!-- 启用实体关系提取 -->
@@ -34,6 +42,22 @@
         </div>
       </div>
 
+      <div v-if="localGraphExtract.enabled" class="setting-row vertical">
+        <div class="setting-info">
+          <label>{{ t('graphSettings.customInstructionsLabel') }}</label>
+          <p class="desc">{{ t('graphSettings.customInstructionsDescription') }}</p>
+        </div>
+        <div class="setting-control full-width">
+          <t-textarea
+            v-model="localGraphExtract.customInstructions"
+            :placeholder="t('graphSettings.customInstructionsPlaceholder')"
+            :maxlength="4000"
+            :autosize="{ minRows: 3, maxRows: 8 }"
+            @change="handleConfigChange"
+          />
+        </div>
+      </div>
+
       <!-- 关系类型配置 -->
       <div v-if="localGraphExtract.enabled" class="setting-row vertical">
         <div class="setting-info">
@@ -43,6 +67,7 @@
         <div class="setting-control full-width">
           <div class="tags-control-group">
             <t-button
+              v-if="canRunGraphExtract"
               theme="default"
               size="medium"
               :disabled="!modelStatus.llm.available"
@@ -79,6 +104,7 @@
         <div class="setting-control full-width">
           <div class="text-control-group">
             <t-button
+              v-if="canRunGraphExtract"
               theme="default"
               size="medium"
               :disabled="!modelStatus.llm.available"
@@ -266,6 +292,7 @@
         <div class="setting-control">
           <div class="action-buttons">
             <t-button
+              v-if="canRunGraphExtract"
               theme="primary"
               :disabled="!modelStatus.llm.available || !localGraphExtract.text"
               :loading="extracting"
@@ -296,11 +323,17 @@
 import { ref, watch, onMounted, computed } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
-import { extractTextRelations, fabriText, fabriTag, type Node, type Relation, type LLMConfig } from '@/api/initialization'
-import { listModels } from '@/api/model'
-import { getSystemInfo } from '@/api/system'
+import { extractTextRelations, fabriText, fabriTag, type Node, type Relation } from '@/api/initialization'
+import { useEditorResourcesStore } from '@/stores/editorResources'
+import { useAuthStore } from '@/stores/auth'
 
 const { t } = useI18n()
+const authStore = useAuthStore()
+
+// canRunGraphExtract 对应后端 POST /initialization/extract/{fabri-tag,fabri-text,
+// text-relation} 的 g.Admin() 守卫——这三个都是会调用大模型 + 写库的 admin
+// 工具。Contributor 看到按钮点了只会撞 403。
+const canRunGraphExtract = computed(() => authStore.hasRole('admin'))
 
 interface GraphExtractConfig {
   enabled: boolean
@@ -308,38 +341,42 @@ interface GraphExtractConfig {
   tags: string[]
   nodes: Node[]
   relations: Relation[]
+  customInstructions?: string
 }
 
 interface Props {
   graphExtract: GraphExtractConfig
+  modelId: string
   allModels?: any[]
+  embedded?: boolean
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  embedded: false,
+})
 
 const emit = defineEmits<{
   'update:graphExtract': [value: GraphExtractConfig]
 }>()
 
+const modelStatus = computed(() => ({
+  llm: {
+    available: !!props.modelId
+  }
+}))
+
 // 本地状态
 const localGraphExtract = ref<GraphExtractConfig>({
   ...props.graphExtract,
   nodes: props.graphExtract.nodes || [],
-  relations: props.graphExtract.relations || []
+  relations: props.graphExtract.relations || [],
+  customInstructions: props.graphExtract.customInstructions || ''
 })
 
 // 加载状态
 const tagFabring = ref(false)
 const textFabring = ref(false)
 const extracting = ref(false)
-
-// 模型状态
-const modelStatus = ref({
-  llm: {
-    available: false,
-    config: null as LLMConfig | null
-  }
-})
 
 // 系统信息
 const systemInfo = ref<any>(null)
@@ -354,7 +391,8 @@ watch(() => props.graphExtract, (newVal) => {
   localGraphExtract.value = {
     ...newVal,
     nodes: newVal.nodes || [],
-    relations: newVal.relations || []
+    relations: newVal.relations || [],
+    customInstructions: newVal.customInstructions || ''
   }
 }, { deep: true })
 
@@ -365,7 +403,7 @@ const handleConfigChange = () => {
 
 // 处理启用/禁用切换
 const handleEnabledChange = () => {
-  // 当关闭提取功能时，清空所有数据
+  // 当关闭提取功能时，清空示例数据，但保留自定义指令以便再次启用时恢复。
   if (!localGraphExtract.value.enabled) {
     localGraphExtract.value.text = ''
     localGraphExtract.value.tags = []
@@ -438,16 +476,9 @@ const removeRelation = (index: number) => {
 
 // 生成随机标签
 const handleFabriTag = async () => {
-  if (!modelStatus.value.llm.available || !modelStatus.value.llm.config) {
-    MessagePlugin.warning(t('graphSettings.completeModelConfig'))
-    return
-  }
-  
   tagFabring.value = true
   try {
-    const response = await fabriTag({
-      llm_config: modelStatus.value.llm.config
-    })
+    const response = await fabriTag({})
     localGraphExtract.value.tags = response.tags || []
     handleTagsChange()
     MessagePlugin.success(t('graphSettings.tagsGenerated'))
@@ -461,7 +492,7 @@ const handleFabriTag = async () => {
 
 // 生成随机文本
 const handleFabriText = async () => {
-  if (!modelStatus.value.llm.available || !modelStatus.value.llm.config) {
+  if (!props.modelId) {
     MessagePlugin.warning(t('graphSettings.completeModelConfig'))
     return
   }
@@ -470,7 +501,7 @@ const handleFabriText = async () => {
   try {
     const response = await fabriText({
       tags: localGraphExtract.value.tags,
-      llm_config: modelStatus.value.llm.config
+      model_id: props.modelId
     })
     localGraphExtract.value.text = response.text || ''
     handleTextChange()
@@ -485,7 +516,7 @@ const handleFabriText = async () => {
 
 // 提取实体关系
 const handleExtract = async () => {
-  if (!modelStatus.value.llm.available || !modelStatus.value.llm.config) {
+  if (!props.modelId) {
     MessagePlugin.warning(t('graphSettings.completeModelConfig'))
     return
   }
@@ -500,7 +531,7 @@ const handleExtract = async () => {
     const response = await extractTextRelations({
       text: localGraphExtract.value.text,
       tags: localGraphExtract.value.tags,
-      llm_config: modelStatus.value.llm.config
+      model_id: props.modelId
     })
     localGraphExtract.value.nodes = response.nodes || []
     localGraphExtract.value.relations = response.relations || []
@@ -543,33 +574,13 @@ const clearExtractExample = () => {
   MessagePlugin.success(t('graphSettings.exampleCleared'))
 }
 
-// 加载模型状态
-const loadModelStatus = async () => {
-  try {
-    const models = await listModels()
-    
-    // 查找可用的KnowledgeQA模型（对话模型）
-    const llmModels = models.filter((m: any) => m.type === 'KnowledgeQA')
-    if (llmModels.length > 0) {
-      const llmModel = llmModels[0]
-      modelStatus.value.llm.available = true
-      modelStatus.value.llm.config = {
-        source: llmModel.source,
-        model_name: llmModel.name,
-        base_url: llmModel.parameters?.base_url || '',
-        api_key: llmModel.parameters?.api_key || ''
-      }
-    }
-  } catch (error: any) {
-    console.error('Failed to load model status:', error)
-  }
-}
+const editorResources = useEditorResourcesStore()
 
 // 加载系统信息
-const loadSystemInfo = async () => {
+const loadSystemInfo = async (force = false) => {
   try {
-    const response = await getSystemInfo()
-    systemInfo.value = response.data
+    await editorResources.ensureSystemInfo(force)
+    systemInfo.value = editorResources.systemInfo
   } catch (error: any) {
     console.error('Failed to load system info:', error)
   }
@@ -586,10 +597,7 @@ const handleOpenGraphGuide = () => {
 
 // 初始化
 onMounted(async () => {
-  await Promise.all([
-    loadModelStatus(),
-    loadSystemInfo()
-  ])
+  await loadSystemInfo()
 })
 </script>
 
@@ -599,13 +607,13 @@ onMounted(async () => {
 }
 
 .section-header {
-  margin-bottom: 32px;
+  margin-bottom: 20px;
 
   h2 {
     font-size: 20px;
     font-weight: 600;
     color: var(--td-text-color-primary);
-    margin: 0 0 8px 0;
+    margin: 0 0 6px 0;
   }
 
   .section-description {
@@ -626,7 +634,7 @@ onMounted(async () => {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  padding: 20px 0;
+  padding: 16px 0;
   border-bottom: 1px solid var(--td-component-stroke);
 
   &:last-child {
@@ -645,8 +653,8 @@ onMounted(async () => {
 }
 
 .setting-info {
-  flex: 1;
-  max-width: 65%;
+  flex: 0 0 40%;
+  max-width: 40%;
   padding-right: 24px;
 
   label {
@@ -666,8 +674,8 @@ onMounted(async () => {
 }
 
 .setting-control {
-  flex-shrink: 0;
-  min-width: 280px;
+  flex: 0 0 55%;
+  max-width: 55%;
   display: flex;
   justify-content: flex-end;
   align-items: center;
@@ -787,5 +795,28 @@ onMounted(async () => {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.graph-settings--embedded {
+  .embedded-graph-alert {
+    margin-bottom: 12px;
+  }
+
+  .setting-row:not(.vertical) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px 0;
+  }
+
+  .setting-row:not(.vertical) .setting-info {
+    flex: none;
+    max-width: none;
+    padding-right: 0;
+  }
+
+  .setting-row:not(.vertical) .setting-control {
+    align-self: flex-start;
+  }
 }
 </style>

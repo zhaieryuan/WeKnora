@@ -9,15 +9,22 @@ import (
 	"net/http"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 // OpenAIReranker implements a reranking system based on OpenAI models
 type OpenAIReranker struct {
-	modelName string       // Name of the model used for reranking
-	modelID   string       // Unique identifier of the model
-	apiKey    string       // API key for authentication
-	baseURL   string       // Base URL for API requests
-	client    *http.Client // HTTP client for making API requests
+	modelName     string       // Name of the model used for reranking
+	modelID       string       // Unique identifier of the model
+	apiKey        string       // API key for authentication
+	baseURL       string       // Base URL for API requests
+	client        *http.Client // HTTP client for making API requests
+	customHeaders map[string]string
+}
+
+// SetCustomHeaders 设置用户自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+func (r *OpenAIReranker) SetCustomHeaders(headers map[string]string) {
+	r.customHeaders = headers
 }
 
 // RerankRequest represents a request to rerank documents based on relevance to a query
@@ -49,13 +56,16 @@ func NewOpenAIReranker(config *RerankerConfig) (*OpenAIReranker, error) {
 	if url := config.BaseURL; url != "" {
 		baseURL = url
 	}
+	if err := validateRerankBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 
 	return &OpenAIReranker{
 		modelName: config.ModelName,
 		modelID:   config.ModelID,
 		apiKey:    apiKey,
 		baseURL:   baseURL,
-		client:    &http.Client{},
+		client:    newRerankHTTPClient(0),
 	}, nil
 }
 
@@ -81,12 +91,9 @@ func (r *OpenAIReranker) Rerank(ctx context.Context, query string, documents []s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", r.apiKey))
+	secutils.ApplyCustomHeaders(req, r.customHeaders)
 
-	// Log the curl equivalent for debugging (API key masked for security)
-	logger.GetLogger(ctx).Infof(
-		"curl -X POST %s/rerank -H \"Content-Type: application/json\" -H \"Authorization: Bearer ***\" -d '%s'",
-		r.baseURL, string(jsonData),
-	)
+	logger.Debugf(ctx, "%s", buildRerankRequestDebug(r.modelName, fmt.Sprintf("%s/rerank", r.baseURL), query, documents))
 
 	resp, err := r.client.Do(req)
 	if err != nil {

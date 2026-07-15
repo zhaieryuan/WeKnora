@@ -3,26 +3,42 @@ import i18n from '@/i18n'
 
 const t = (key: string) => i18n.global.t(key)
 
+// GET /initialization/config/:kbId exposes credential presence, not values.
+export interface ModelCredentialStatus {
+    apiKey?: boolean;
+}
+
+export interface COSCredentialStatus {
+    secretId?: boolean;
+    secretKey?: boolean;
+}
+
 // 初始化配置数据类型
 export interface InitializationConfig {
     llm: {
         source: string;
         modelName: string;
         baseUrl?: string;
+        /** @deprecated Use credentials.apiKey from GET responses */
         apiKey?: string;
+        credentials?: ModelCredentialStatus;
     };
     embedding: {
         source: string;
         modelName: string;
         baseUrl?: string;
+        /** @deprecated Use credentials.apiKey from GET responses */
         apiKey?: string;
         dimension?: number; // 添加embedding维度字段
+        credentials?: ModelCredentialStatus;
     };
     rerank: {
         modelName: string;
         baseUrl: string;
+        /** @deprecated Use credentials.apiKey from GET responses */
         apiKey?: string;
         enabled: boolean;
+        credentials?: ModelCredentialStatus;
     };
     multimodal: {
         enabled: boolean;
@@ -30,16 +46,21 @@ export interface InitializationConfig {
         vlm?: {
             modelName: string;
             baseUrl: string;
+            /** @deprecated Use credentials.apiKey from GET responses */
             apiKey?: string;
             interfaceType?: string; // "ollama" or "openai"
+            credentials?: ModelCredentialStatus;
         };
         cos?: {
-            secretId: string;
-            secretKey: string;
             region: string;
             bucketName: string;
             appId: string;
             pathPrefix?: string;
+            /** @deprecated Use credentials from GET responses */
+            secretId?: string;
+            /** @deprecated Use credentials from GET responses */
+            secretKey?: string;
+            credentials?: COSCredentialStatus;
         };
         minio?: {
             bucketName: string;
@@ -50,6 +71,14 @@ export interface InitializationConfig {
         chunkSize: number;
         chunkOverlap: number;
         separators: string[];
+        // Adaptive chunking strategy. Empty / "legacy" = classic recursive splitter.
+        // "auto" lets the backend profiler pick a tier; "heading" / "heuristic"
+        // pin the tier explicitly. See backend chunker package for details.
+        strategy?: string;
+        // Cap chunk size in approx tokens. 0 = char-based budget only.
+        tokenLimit?: number;
+        // Language hints for heuristic patterns ("de", "en", "zh"). Empty = auto-detect.
+        languages?: string[];
     };
     // Frontend-only hint for storage selection UI
     storageType?: 'cos' | 'minio';
@@ -80,6 +109,13 @@ export interface KBModelConfigRequest {
     vlm_config?: {
         enabled: boolean
         model_id?: string
+        description_language?: string
+        custom_instructions?: string
+    }
+    asr_config?: {
+        enabled: boolean
+        model_id?: string
+        language?: string
     }
     documentSplitting: {
         chunkSize: number
@@ -89,11 +125,24 @@ export interface KBModelConfigRequest {
         enableParentChild?: boolean
         parentChunkSize?: number
         childChunkSize?: number
+        // Adaptive chunking strategy ("auto" | "heading" | "heuristic" | "legacy").
+        // The backend uses pointer-based DTOs for these three fields:
+        // - undefined / not set in payload → no change on server
+        // - "" / 0 / [] explicitly sent     → clears the value
+        // Send the field whenever the user has opened the editor — even
+        // empty values — so the user can always reset back to defaults.
+        strategy?: string
+        // Approximate token budget per chunk; 0 = char-based.
+        tokenLimit?: number
+        // Language hints for heuristic patterns. Empty array = auto-detect.
+        languages?: string[]
+        tableMetadataInstructions?: string
     }
     multimodal: {
         enabled: boolean
     }
-    /** 存储引擎选择："local" | "minio" | "cos"，影响文档上传与文档内图片存储 */
+    /** 存储引擎选择："local" | "minio" | "cos" | "obs" 等，影响文档上传与文档内图片存储 */
+    storageBackendId?: string
     storageProvider?: string
     nodeExtract: {
         enabled: boolean
@@ -101,10 +150,12 @@ export interface KBModelConfigRequest {
         tags: string[]
         nodes: Node[]
         relations: Relation[]
+        customInstructions?: string
     }
     questionGeneration?: {
         enabled: boolean
         questionCount: number
+        customInstructions?: string
     }
 }
 
@@ -245,12 +296,27 @@ export function getCurrentConfigByKB(kbId: string): Promise<InitializationConfig
     });
 }
 
+// 所有"测试连接"接口共用的通用可选参数。
+// customHeaders / extraConfig / interfaceType 对应后端 ModelTestRequest 里的同名字段，
+// 会被透传给真正的模型装配流程，保证测试连接与生产调用走完全相同的路径。
+interface BaseModelTestPayload {
+    customHeaders?: Record<string, string>;
+    extraConfig?: Record<string, string>;
+    interfaceType?: string;
+    /** 第二段密钥（如 LKEAP Rerank 的腾讯云 SecretKey） */
+    appSecret?: string;
+}
+
 // 检查远程API模型
 export function checkRemoteModel(modelConfig: {
     modelName: string;
     baseUrl: string;
     apiKey?: string;
-}): Promise<{
+    provider?: string;
+    // 编辑已存在模型时传 modelId，后端会自动从存储中带出 apiKey
+    // （前端不再回显明文密钥，所以测试连接必须用这个回填路径）
+    modelId?: string;
+} & BaseModelTestPayload): Promise<{
     available: boolean;
     message?: string;
 }> {
@@ -273,8 +339,10 @@ export function testEmbeddingModel(modelConfig: {
     baseUrl?: string;
     apiKey?: string;
     dimension?: number;
+    supportsDimensionOverride?: boolean;
     provider?: string;
-}): Promise<{ available: boolean; message?: string; dimension?: number }> {
+    modelId?: string;
+} & BaseModelTestPayload): Promise<{ available: boolean; message?: string; dimension?: number }> {
     return new Promise((resolve, reject) => {
         post('/api/v1/initialization/embedding/test', modelConfig)
             .then((response: any) => {
@@ -292,7 +360,9 @@ export function checkRerankModel(modelConfig: {
     modelName: string;
     baseUrl: string;
     apiKey?: string;
-}): Promise<{
+    provider?: string;
+    modelId?: string;
+} & BaseModelTestPayload): Promise<{
     available: boolean;
     message?: string;
 }> {
@@ -303,6 +373,29 @@ export function checkRerankModel(modelConfig: {
             })
             .catch((error: any) => {
                 console.error('Failed to check Rerank model:', error);
+                reject(error);
+            });
+    });
+}
+
+// 检查 ASR 模型连接（通过 /v1/audio/transcriptions 端点测试）
+export function checkASRModel(modelConfig: {
+    modelName: string;
+    baseUrl: string;
+    apiKey?: string;
+    provider?: string;
+    modelId?: string;
+} & BaseModelTestPayload): Promise<{
+    available: boolean;
+    message?: string;
+}> {
+    return new Promise((resolve, reject) => {
+        post('/api/v1/initialization/asr/check', modelConfig)
+            .then((response: any) => {
+                resolve(response.data || {});
+            })
+            .catch((error: any) => {
+                console.error('Failed to check ASR model:', error);
                 reject(error);
             });
     });
@@ -372,19 +465,12 @@ export function testMultimodalFunction(testData: {
             headers['Authorization'] = `Bearer ${token}`;
         }
 
-        // 添加跨租户访问请求头（如果选择了其他租户）
+        // 跨空间访问请求头：直接附，避免 short-circuit "selectedTenantId
+        // === defaultTenantId 时不附" 在某些边角下让 header 静默丢失。
+        // 与 utils/request.ts、api/chat/streame.ts 行为一致。
         const selectedTenantId = localStorage.getItem('weknora_selected_tenant_id');
-        const defaultTenantId = localStorage.getItem('weknora_tenant');
         if (selectedTenantId) {
-            try {
-                const defaultTenant = defaultTenantId ? JSON.parse(defaultTenantId) : null;
-                const defaultId = defaultTenant?.id ? String(defaultTenant.id) : null;
-                if (selectedTenantId !== defaultId) {
-                    headers['X-Tenant-ID'] = selectedTenantId;
-                }
-            } catch (e) {
-                console.error('Failed to parse tenant info', e);
-            }
+            headers['X-Tenant-ID'] = selectedTenantId;
         }
 
         // 使用原生fetch因为需要发送FormData
@@ -412,7 +498,7 @@ export function testMultimodalFunction(testData: {
 export interface TextRelationExtractionRequest {
     text: string;
     tags: string[];
-    llm_config: LLMConfig;
+    model_id: string;
 }
 
 export interface Node {
@@ -424,13 +510,6 @@ export interface Relation {
     node1: string;
     node2: string;
     type: string;
-}
-
-export interface LLMConfig {
-    source: 'local' | 'remote';
-    model_name: string;
-    base_url: string;
-    api_key: string;
 }
 
 export interface TextRelationExtractionResponse {
@@ -454,7 +533,7 @@ export function extractTextRelations(request: TextRelationExtractionRequest): Pr
 
 export interface FabriTextRequest {
     tags: string[];
-    llm_config: LLMConfig;
+    model_id: string;
 }
 
 export interface FabriTextResponse {
@@ -476,7 +555,6 @@ export function fabriText(request: FabriTextRequest): Promise<FabriTextResponse>
 }
 
 export interface FabriTagRequest {
-    llm_config: LLMConfig;
 }
 
 export interface FabriTagResponse {

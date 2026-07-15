@@ -9,15 +9,22 @@ import (
 	"net/http"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 // ZhipuReranker implements a reranking system based on Zhipu AI models
 type ZhipuReranker struct {
-	modelName string       // Name of the model used for reranking
-	modelID   string       // Unique identifier of the model
-	apiKey    string       // API key for authentication
-	baseURL   string       // Base URL for API requests
-	client    *http.Client // HTTP client for making API requests
+	modelName     string       // Name of the model used for reranking
+	modelID       string       // Unique identifier of the model
+	apiKey        string       // API key for authentication
+	baseURL       string       // Base URL for API requests
+	client        *http.Client // HTTP client for making API requests
+	customHeaders map[string]string
+}
+
+// SetCustomHeaders 设置用户自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+func (r *ZhipuReranker) SetCustomHeaders(headers map[string]string) {
+	r.customHeaders = headers
 }
 
 // ZhipuRerankRequest represents a request to rerank documents using Zhipu AI API
@@ -58,13 +65,16 @@ func NewZhipuReranker(config *RerankerConfig) (*ZhipuReranker, error) {
 	if url := config.BaseURL; url != "" {
 		baseURL = url
 	}
+	if err := validateRerankBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 
 	return &ZhipuReranker{
 		modelName: config.ModelName,
 		modelID:   config.ModelID,
 		apiKey:    apiKey,
 		baseURL:   baseURL,
-		client:    &http.Client{},
+		client:    newRerankHTTPClient(0),
 	}, nil
 }
 
@@ -92,11 +102,9 @@ func (r *ZhipuReranker) Rerank(ctx context.Context, query string, documents []st
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", r.apiKey))
+	secutils.ApplyCustomHeaders(req, r.customHeaders)
 
-	// Log the curl equivalent for debugging
-	logger.Debugf(ctx, "curl -X POST %s -H \"Content-Type: application/json\" -H \"Authorization: Bearer %s\" -d '%s'",
-		r.baseURL, r.apiKey, string(jsonData),
-	)
+	logger.Debugf(ctx, "%s", buildRerankRequestDebug(r.modelName, r.baseURL, query, documents))
 
 	resp, err := r.client.Do(req)
 	if err != nil {

@@ -1,8 +1,9 @@
 # 忽略所有隐藏文件和目录
 .*
-# 但不忽略示例文件
+# 但不忽略特定隐藏文件和目录
 !.env.example
 !.gitignore
+!.github/
 
 # 敏感文件
 *.pem
@@ -29,16 +30,30 @@ logs/
 
 WeKnora
 WeKnora-lite
+cmd/desktop/build/bin/
 /models/
 test/data/mswag.txt
 data/files/
 data/weknora.db
 data/weknora.db-wal
 data/weknora.db-shm
+skills-lock.json
 
 web/
 
 **/__pycache__
 /scripts/scale_dev_jobs.sh
-server
+/server
 frontend/.vite
+frontend/chrome-extension/
+WeKnora-Chrome-Extension
+packages/protoc-3.19.4-linux-x86_64.zip
+
+Claude.md
+
+# 本地测试脚本
+configure-ollama.sh
+fix-docker.sh
+
+# WeChat Mini Program local/private configuration
+miniprogram/project.private.config.json

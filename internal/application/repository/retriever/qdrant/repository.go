@@ -3,9 +3,6 @@ package qdrant
 import (
 	"context"
 	"fmt"
-	"maps"
-	"os"
-	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -30,20 +27,19 @@ const (
 	fieldIsEnabled        = "is_enabled"
 )
 
-// NewQdrantRetrieveEngineRepository creates and initializes a new Qdrant repository
-func NewQdrantRetrieveEngineRepository(client *qdrant.Client) interfaces.RetrieveEngineRepository {
+// NewQdrantRetrieveEngineRepository creates and initializes a new Qdrant repository.
+// indexCfg is optional — pass nil to use env var / default values (env path).
+func NewQdrantRetrieveEngineRepository(client *qdrant.Client, indexCfg *types.IndexConfig) interfaces.RetrieveEngineRepository {
 	log := logger.GetLogger(context.Background())
 	log.Info("[Qdrant] Initializing Qdrant retriever engine repository")
 
-	collectionBaseName := os.Getenv(envQdrantCollection)
-	if collectionBaseName == "" {
-		log.Warn("[Qdrant] QDRANT_COLLECTION environment variable not set, using default collection name")
-		collectionBaseName = defaultCollectionName
-	}
+	collectionBaseName := types.ResolveCollectionName(indexCfg, envQdrantCollection, defaultCollectionName)
 
 	res := &qdrantRepository{
 		client:             client,
 		collectionBaseName: collectionBaseName,
+		shardNumber:        indexCfg.GetShardNumber(0),
+		replicationFactor:  indexCfg.GetReplicationFactor(0),
 	}
 
 	log.Info("[Qdrant] Successfully initialized repository")
@@ -82,6 +78,8 @@ func (q *qdrantRepository) ensureCollection(ctx context.Context, dimension int) 
 				Size:     uint64(dimension),
 				Distance: qdrant.Distance_Cosine,
 			}),
+			ShardNumber:       types.OptionalUint32(q.shardNumber),
+			ReplicationFactor: types.OptionalUint32(q.replicationFactor),
 		})
 		if err != nil {
 			log.Errorf("[Qdrant] Failed to create collection: %v", err)
@@ -196,7 +194,7 @@ func (q *qdrantRepository) Save(ctx context.Context,
 	})
 	if err != nil {
 		log.Errorf("[Qdrant] Failed to save index: %v", err)
-		return err
+		return fmt.Errorf("failed to save index for chunk ID %s: %w", embedding.ChunkID, err)
 	}
 
 	log.Infof("[Qdrant] Successfully saved index for chunk ID: %s, point ID: %s", embedding.ChunkID, pointID)
@@ -242,19 +240,28 @@ func (q *qdrantRepository) BatchSave(ctx context.Context,
 
 	// Save points to each dimension-specific collection
 	totalSaved := 0
+	const batchSize = 100
 	for dimension, points := range pointsByDimension {
 		if err := q.ensureCollection(ctx, dimension); err != nil {
 			return err
 		}
 
 		collectionName := q.getCollectionName(dimension)
-		_, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
-			CollectionName: collectionName,
-			Points:         points,
-		})
-		if err != nil {
-			log.Errorf("[Qdrant] Failed to execute batch operation for dimension %d: %v", dimension, err)
-			return fmt.Errorf("failed to batch save (dimension %d): %w", dimension, err)
+
+		for i := 0; i < len(points); i += batchSize {
+			end := i + batchSize
+			if end > len(points) {
+				end = len(points)
+			}
+			batch := points[i:end]
+
+			_, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
+				CollectionName: collectionName,
+				Points:         batch,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to upsert batch: %w", err)
+			}
 		}
 		totalSaved += len(points)
 		log.Infof("[Qdrant] Saved %d points to collection %s", len(points), collectionName)
@@ -840,7 +847,7 @@ func (q *qdrantRepository) CopyIndices(ctx context.Context,
 			})
 			if err != nil {
 				log.Errorf("[Qdrant] Failed to batch upsert target points: %v", err)
-				return err
+				return fmt.Errorf("failed to batch upsert target points during copy: %w", err)
 			}
 
 			totalCopied += len(targetPoints)
@@ -931,9 +938,11 @@ func toQdrantVectorEmbedding(embedding *types.IndexInfo, additionalParams map[st
 		TagID:           embedding.TagID,
 		IsEnabled:       embedding.IsEnabled,
 	}
-	if additionalParams != nil && slices.Contains(slices.Collect(maps.Keys(additionalParams)), fieldEmbedding) {
-		if embeddingMap, ok := additionalParams[fieldEmbedding].(map[string][]float32); ok {
-			vector.Embedding = embeddingMap[embedding.SourceID]
+	if additionalParams != nil {
+		if val, exists := additionalParams[fieldEmbedding]; exists {
+			if embeddingMap, ok := val.(map[string][]float32); ok {
+				vector.Embedding = embeddingMap[embedding.SourceID]
+			}
 		}
 	}
 	return vector

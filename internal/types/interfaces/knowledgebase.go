@@ -6,9 +6,11 @@ package interfaces
 
 import (
 	"context"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/hibiken/asynq"
+	"gorm.io/gorm"
 )
 
 // KnowledgeBaseService defines the knowledge base service interface
@@ -93,6 +95,17 @@ type KnowledgeBaseService interface {
 	//   - Possible errors such as not existing, insufficient permissions, search engine errors, etc.
 	HybridSearch(ctx context.Context, id string, params types.SearchParams) ([]*types.SearchResult, error)
 
+	// GetQueryEmbedding computes the query embedding using the embedding model
+	// associated with the given knowledge base. This allows callers to pre-compute
+	// and reuse embeddings across multiple KBs that share the same model.
+	GetQueryEmbedding(ctx context.Context, kbID string, queryText string) ([]float32, error)
+
+	// ResolveEmbeddingModelKeys resolves embedding model IDs to their actual
+	// model identity key (name + endpoint). KBs using the same underlying model
+	// across different tenants will share the same key, enabling optimal grouping.
+	// Returns a map from KB ID to model identity key string.
+	ResolveEmbeddingModelKeys(ctx context.Context, kbs []*types.KnowledgeBase) map[string]string
+
 	// CopyKnowledgeBase copies a knowledge base
 	// Parameters:
 	//   - ctx: Context information
@@ -102,6 +115,11 @@ type KnowledgeBaseService interface {
 	//   - Copied knowledge base object
 	//   - Possible errors such as not existing, insufficient permissions, etc.
 	CopyKnowledgeBase(ctx context.Context, src string, dst string) (*types.KnowledgeBase, *types.KnowledgeBase, error)
+
+	// DuplicateKnowledgeBase creates a new settings-only knowledge base duplicate.
+	// It does not copy knowledge entries, chunks, FAQ rows, wiki pages, indexes,
+	// data sources, shares, pins, or task state. A new UUID is always generated.
+	DuplicateKnowledgeBase(ctx context.Context, src string) (*types.KnowledgeBase, error)
 
 	// GetRepository gets the knowledge base repository
 	// Parameters:
@@ -194,6 +212,33 @@ type KnowledgeBaseRepository interface {
 	//   - Possible errors such as record not existing, database errors, etc.
 	DeleteKnowledgeBase(ctx context.Context, id string) error
 
-	// TogglePinKnowledgeBase toggles the pin status of a knowledge base
-	TogglePinKnowledgeBase(ctx context.Context, id string, tenantID uint64) (*types.KnowledgeBase, error)
+	// CountByVectorStoreID counts active KBs bound to the given vector store
+	// within a tenant scope. Accepts a *gorm.DB handle so callers can share a
+	// transaction (e.g., the VectorStore delete guard's row-lock context) or
+	// run standalone (pass nil → uses the repository's default db).
+	//
+	// The soft-delete filter is applied automatically by the gorm.DeletedAt
+	// scope on KnowledgeBase; implementations MUST NOT add an explicit
+	// `deleted_at IS NULL` predicate (avoids divergence with the auto-scope).
+	CountByVectorStoreID(ctx context.Context, db *gorm.DB, tenantID uint64, storeID string) (int64, error)
+
+	// CountByModelID counts active KBs in the tenant that reference the given
+	// model ID in any model-binding field (embedding, summary, VLM, ASR, etc.).
+	CountByModelID(ctx context.Context, tenantID uint64, modelID string) (int64, error)
+	// SetUserKBPin inserts or removes a row in user_kb_pins for the given
+	// (tenant, user, kb) triple. Returns the resulting pinned_at (nil when
+	// pinned=false) and an error. The tenant_id is captured to support
+	// efficient "wipe a tenant" cleanups even though (user_id, kb_id)
+	// alone would be unique in practice.
+	SetUserKBPin(
+		ctx context.Context, tenantID uint64, userID string, kbID string, pinned bool,
+	) (pinnedAt *time.Time, err error)
+
+	// ListUserKBPinIDs returns the kb_id → pinned_at map of every KB the
+	// given user has personally pinned in this tenant. Used by the list
+	// path to stamp KnowledgeBase.IsPinned / PinnedAt without a per-row
+	// roundtrip.
+	ListUserKBPinIDs(
+		ctx context.Context, tenantID uint64, userID string,
+	) (map[string]time.Time, error)
 }

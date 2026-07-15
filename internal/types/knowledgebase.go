@@ -9,11 +9,30 @@ import (
 	"gorm.io/gorm"
 )
 
+const storageBackendScheme = "storage://"
+
+func BuildStorageBackendPath(backendID, providerPath string) string {
+	return storageBackendScheme + strings.TrimSpace(backendID) + "/" + providerPath
+}
+
+func ParseStorageBackendPath(path string) (backendID, providerPath string, ok bool) {
+	if !strings.HasPrefix(path, storageBackendScheme) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(path, storageBackendScheme)
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 // KnowledgeBaseType represents the type of the knowledge base
 const (
 	// KnowledgeBaseTypeDocument represents the document knowledge base type
 	KnowledgeBaseTypeDocument = "document"
 	KnowledgeBaseTypeFAQ      = "faq"
+	KnowledgeBaseTypeWiki     = "wiki"
 )
 
 // FAQIndexMode represents the FAQ index mode: only index questions or index questions and answers
@@ -48,8 +67,14 @@ type KnowledgeBase struct {
 	IsTemporary bool `yaml:"is_temporary"            json:"is_temporary"            gorm:"default:false"`
 	// Description of the knowledge base
 	Description string `yaml:"description"             json:"description"`
-	// Tenant ID
+	// Workspace ID
 	TenantID uint64 `yaml:"tenant_id"               json:"tenant_id"`
+	// CreatorID records the user ID of whoever originally created the KB.
+	// Used by the workspace-level RBAC middleware to let Contributors edit
+	// their own KBs without granting them access to everyone else's.
+	// Nullable for backward compatibility with rows created before the
+	// RBAC migration backfilled the column to the workspace Owner.
+	CreatorID string `yaml:"creator_id"              json:"creator_id"              gorm:"type:varchar(36);index"`
 	// Chunking configuration
 	ChunkingConfig ChunkingConfig `yaml:"chunking_config"         json:"chunking_config"         gorm:"type:json"`
 	// Image processing configuration
@@ -60,20 +85,45 @@ type KnowledgeBase struct {
 	SummaryModelID string `yaml:"summary_model_id"        json:"summary_model_id"`
 	// VLM config
 	VLMConfig VLMConfig `yaml:"vlm_config"              json:"vlm_config"              gorm:"type:json"`
-	// Storage provider config (new): only stores provider selection; credentials from tenant StorageEngineConfig
+	// ASR config (Automatic Speech Recognition)
+	ASRConfig ASRConfig `yaml:"asr_config"              json:"asr_config"              gorm:"type:json"`
+	// Storage provider config (new): only stores provider selection; credentials from workspace StorageEngineConfig
 	StorageProviderConfig *StorageProviderConfig `yaml:"storage_provider_config" json:"storage_provider_config"  gorm:"column:storage_provider_config;type:jsonb"`
+	// StorageBackendID binds this KB to one concrete storage instance. The
+	// legacy provider field remains readable during migration only.
+	StorageBackendID *string `yaml:"storage_backend_id" json:"storage_backend_id,omitempty" gorm:"column:storage_backend_id;type:varchar(36);default:null"`
 	// Deprecated: legacy COS config column. Kept for backward compatibility with old data.
 	StorageConfig StorageConfig `yaml:"-" json:"storage_config" gorm:"column:cos_config;type:json"`
+	// VectorStoreID references the VectorStore this knowledge base is bound to.
+	// When nil, the KB falls back to the workspace's effective engines derived from
+	// the RETRIEVE_DRIVER environment variable (env store flow).
+	// This field is set once at creation time and must not be modified afterwards;
+	// enforcement lives at the GORM layer (`<-:create`) plus the service-layer
+	// KB update path, which omits this field from its update DTO.
+	VectorStoreID *string `yaml:"vector_store_id"         json:"vector_store_id,omitempty" gorm:"column:vector_store_id;type:varchar(36);<-:create"`
 	// Extract config
 	ExtractConfig *ExtractConfig `yaml:"extract_config"          json:"extract_config"          gorm:"column:extract_config;type:json"`
 	// FAQConfig stores FAQ specific configuration such as indexing strategy
 	FAQConfig *FAQConfig `yaml:"faq_config"              json:"faq_config"              gorm:"column:faq_config;type:json"`
 	// QuestionGenerationConfig stores question generation configuration for document knowledge bases
 	QuestionGenerationConfig *QuestionGenerationConfig `yaml:"question_generation_config" json:"question_generation_config" gorm:"column:question_generation_config;type:json"`
-	// Whether this knowledge base is pinned to the top of the list
-	IsPinned bool `yaml:"is_pinned"               json:"is_pinned"               gorm:"default:false"`
-	// Time when the knowledge base was pinned (nil if not pinned)
-	PinnedAt *time.Time `yaml:"pinned_at"               json:"pinned_at"`
+	// WikiConfig stores wiki-specific configuration (only for wiki type knowledge bases)
+	WikiConfig *WikiConfig `yaml:"wiki_config"             json:"wiki_config"             gorm:"column:wiki_config;type:json"`
+	// IndexingStrategy controls which indexing pipelines are active for this knowledge base.
+	// Pipelines: vector search, keyword search, wiki generation, knowledge graph extraction.
+	IndexingStrategy IndexingStrategy `yaml:"indexing_strategy"       json:"indexing_strategy"       gorm:"column:indexing_strategy;type:json"`
+	// IsPinned and PinnedAt are computed per-caller from user_kb_pins
+	// (see migration 000050). They used to be stored on the row itself,
+	// which made pinning a workspace-wide ordering decision gated behind
+	// the kb-edit RBAC guard. The columns are still present in legacy
+	// schemas for rollback safety but are no longer read or written by
+	// the application — both fields are tagged `gorm:"-"` so GORM
+	// ignores them on every CRUD call and the list handler stamps them
+	// after enriching with the caller's pin set.
+	IsPinned bool `yaml:"is_pinned"               json:"is_pinned"               gorm:"-"`
+	// PinnedAt records when the current caller pinned this knowledge
+	// base; nil when they have not.
+	PinnedAt *time.Time `yaml:"pinned_at"               json:"pinned_at"               gorm:"-"`
 	// Creation time of the knowledge base
 	CreatedAt time.Time `yaml:"created_at"              json:"created_at"`
 	// Last updated time of the knowledge base
@@ -90,6 +140,10 @@ type KnowledgeBase struct {
 	ProcessingCount int64 `yaml:"processing_count"        json:"processing_count"        gorm:"-"`
 	// ShareCount indicates the number of organizations this knowledge base is shared with (not stored in database)
 	ShareCount int64 `yaml:"share_count"             json:"share_count"             gorm:"-"`
+	// CreatorName 是 CreatorID 对应用户的展示名（username / email 等），
+	// 仅在列表场景由 handler 批量回填，不落库；为空表示创建者无法解析（用户已删除、
+	// CreatorID 为空的老数据等）。前端用它在卡片来源徽章上做 mine vs workspace 的二分。
+	CreatorName string `yaml:"-"                       json:"creator_name,omitempty"  gorm:"-"`
 }
 
 // KnowledgeBaseConfig represents the knowledge base configuration
@@ -100,6 +154,11 @@ type KnowledgeBaseConfig struct {
 	ImageProcessingConfig ImageProcessingConfig `yaml:"image_processing_config" json:"image_processing_config"`
 	// FAQ configuration (only for FAQ type knowledge bases)
 	FAQConfig *FAQConfig `yaml:"faq_config"              json:"faq_config"`
+	// Wiki configuration (only for wiki-enabled knowledge bases)
+	WikiConfig *WikiConfig `yaml:"wiki_config"             json:"wiki_config"`
+	// IndexingStrategy controls which indexing pipelines are active.
+	// nil means "no change" when updating (preserves existing strategy).
+	IndexingStrategy *IndexingStrategy `yaml:"indexing_strategy"       json:"indexing_strategy"`
 }
 
 // ParserEngineRule maps a set of file types to a specific parser engine.
@@ -116,8 +175,6 @@ type ChunkingConfig struct {
 	ChunkOverlap int `yaml:"chunk_overlap" json:"chunk_overlap"`
 	// Separators
 	Separators []string `yaml:"separators"    json:"separators"`
-	// EnableMultimodal (deprecated, kept for backward compatibility with old data)
-	EnableMultimodal bool `yaml:"enable_multimodal,omitempty" json:"enable_multimodal,omitempty"`
 	// ParserEngineRules configures which parser engine to use for each file type.
 	// When empty, the builtin engine is used for all types.
 	ParserEngineRules []ParserEngineRule `yaml:"parser_engine_rules,omitempty" json:"parser_engine_rules,omitempty"`
@@ -131,6 +188,21 @@ type ChunkingConfig struct {
 	// ChildChunkSize is the size of child chunks used for embedding (default: 384).
 	// Only used when EnableParentChild is true.
 	ChildChunkSize int `yaml:"child_chunk_size,omitempty" json:"child_chunk_size,omitempty"`
+	// Strategy selects the adaptive chunking tier. Empty / "legacy" preserves
+	// the historical recursive splitter; "auto" lets a profiler pick between
+	// heading-aware, heuristic and recursive tiers; "heading" / "heuristic" /
+	// "recursive" pin the tier explicitly.
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// TokenLimit caps chunk size in approximate tokens. 0 = use ChunkSize
+	// as a character count.
+	TokenLimit int `yaml:"token_limit,omitempty" json:"token_limit,omitempty"`
+	// Languages hints the heuristic patterns. Empty = auto-detect from content.
+	// Examples: ["de"], ["en", "zh"].
+	Languages []string `yaml:"languages,omitempty" json:"languages,omitempty"`
+	// TableMetadataInstructions contains optional business guidance used when
+	// generating searchable summaries for CSV/Excel tables. The system-owned
+	// output contract remains fixed; these instructions only add domain context.
+	TableMetadataInstructions string `yaml:"table_metadata_instructions,omitempty" json:"table_metadata_instructions,omitempty"`
 }
 
 // ResolveParserEngine returns the engine name for the given file type
@@ -150,7 +222,7 @@ func (c ChunkingConfig) ResolveParserEngine(fileType string) string {
 // StorageProviderConfig stores the KB-level storage provider selection.
 // Credentials are managed at the tenant level (StorageEngineConfig).
 type StorageProviderConfig struct {
-	Provider string `yaml:"provider" json:"provider"` // "local", "minio", "cos", "tos"
+	Provider string `yaml:"provider" json:"provider"` // "local", "minio", "cos", "tos", "s3", "oss", "ks3", "obs"
 }
 
 func (c StorageProviderConfig) Value() (driver.Value, error) {
@@ -171,13 +243,26 @@ func (c *StorageProviderConfig) Scan(value interface{}) error {
 // Deprecated: StorageConfig is the legacy COS configuration stored in the cos_config column.
 // New code should use StorageProviderConfig. Kept for backward compatibility with old data.
 type StorageConfig struct {
-	SecretID   string `yaml:"secret_id"   json:"secret_id"`
-	SecretKey  string `yaml:"secret_key"  json:"secret_key"`
-	Region     string `yaml:"region"      json:"region"`
+	// Secret ID (COS) / Access Key ID (S3, MinIO)
+	SecretID string `yaml:"secret_id"   json:"secret_id"`
+	// Secret Key (COS) / Secret Access Key (S3, MinIO)
+	SecretKey string `yaml:"secret_key"  json:"secret_key"`
+	// Region
+	Region string `yaml:"region"      json:"region"`
+	// Bucket Name
 	BucketName string `yaml:"bucket_name" json:"bucket_name"`
-	AppID      string `yaml:"app_id"      json:"app_id"`
+	// App ID (COS specific)
+	AppID string `yaml:"app_id"      json:"app_id"`
+	// Path Prefix
 	PathPrefix string `yaml:"path_prefix" json:"path_prefix"`
-	Provider   string `yaml:"provider"    json:"provider"`
+	// Provider: "cos", "minio", "s3"
+	Provider string `yaml:"provider"    json:"provider"`
+	// Endpoint (S3 specific) - e.g., s3.amazonaws.com, oss-cn-hangzhou.aliyuncs.com
+	Endpoint string `yaml:"endpoint"    json:"endpoint,omitempty"`
+	// UseSSL (S3 specific) - whether to use HTTPS
+	UseSSL bool `yaml:"use_ssl"     json:"use_ssl,omitempty"`
+	// ForcePathStyle (S3 specific) - whether to use path-style URLs
+	ForcePathStyle bool `yaml:"force_path_style" json:"force_path_style,omitempty"`
 }
 
 func (c StorageConfig) Value() (driver.Value, error) {
@@ -234,12 +319,44 @@ func (kb *KnowledgeBase) GetStorageProvider() string {
 	return strings.ToLower(strings.TrimSpace(kb.StorageConfig.Provider))
 }
 
+// EffectiveStorageProvider returns the KB's storage provider, falling back to
+// the supplied tenant default when the KB does not pin one. This mirrors the
+// selection logic in resolveFileService and is used by clone preflight checks
+// to detect cross-storage-backend clones (which are not supported).
+func (kb *KnowledgeBase) EffectiveStorageProvider(tenantDefault string) string {
+	if p := kb.GetStorageProvider(); p != "" {
+		return p
+	}
+	return strings.ToLower(strings.TrimSpace(tenantDefault))
+}
+
 // SetStorageProvider writes the provider to the new StorageProviderConfig field.
 func (kb *KnowledgeBase) SetStorageProvider(provider string) {
 	if kb == nil {
 		return
 	}
 	kb.StorageProviderConfig = &StorageProviderConfig{Provider: provider}
+}
+
+// SharesStorageBackendWith compares concrete instance bindings first. Provider
+// comparison is only a compatibility fallback for rows not yet backfilled.
+func (kb *KnowledgeBase) SharesStorageBackendWith(other *KnowledgeBase, defaultBackendID, defaultProvider string) bool {
+	if kb == nil || other == nil {
+		return false
+	}
+	effectiveID := func(candidate *KnowledgeBase) string {
+		if candidate.StorageBackendID != nil {
+			if id := strings.TrimSpace(*candidate.StorageBackendID); id != "" {
+				return id
+			}
+		}
+		return strings.TrimSpace(defaultBackendID)
+	}
+	leftID, rightID := effectiveID(kb), effectiveID(other)
+	if leftID != "" || rightID != "" {
+		return leftID != "" && leftID == rightID
+	}
+	return kb.EffectiveStorageProvider(defaultProvider) == other.EffectiveStorageProvider(defaultProvider)
 }
 
 // InferStorageFromFilePath deduces the storage provider from a file path format.
@@ -264,7 +381,10 @@ func InferStorageFromFilePath(filePath string) string {
 // e.g. "minio://bucket/key" → "minio", "local://tenant/file.pdf" → "local"
 // Returns "" if the path does not use a known provider scheme.
 func ParseProviderScheme(filePath string) string {
-	for _, provider := range []string{"local", "minio", "cos", "tos"} {
+	if _, inner, ok := ParseStorageBackendPath(filePath); ok {
+		filePath = inner
+	}
+	for _, provider := range []string{"local", "minio", "cos", "tos", "s3", "oss", "ks3", "obs"} {
 		if strings.HasPrefix(filePath, provider+"://") {
 			return provider
 		}
@@ -316,6 +436,12 @@ func (c *ImageProcessingConfig) Scan(value interface{}) error {
 type VLMConfig struct {
 	Enabled bool   `yaml:"enabled"  json:"enabled"`
 	ModelID string `yaml:"model_id" json:"model_id"`
+	// DescriptionLanguage controls the language used for generated image
+	// captions. Empty means follow the document/request language.
+	DescriptionLanguage string `yaml:"description_language,omitempty" json:"description_language,omitempty"`
+	// CustomInstructions adds KB-specific image interpretation guidance without
+	// replacing the system-owned OCR and Markdown output contract.
+	CustomInstructions string `yaml:"custom_instructions,omitempty" json:"custom_instructions,omitempty"`
 
 	// 兼容老版本
 	// Model Name
@@ -350,6 +476,9 @@ type QuestionGenerationConfig struct {
 	Enabled bool `yaml:"enabled"  json:"enabled"`
 	// Number of questions to generate per chunk (default: 3, max: 10)
 	QuestionCount int `yaml:"question_count" json:"question_count"`
+	// CustomInstructions describes the intended audience or question style.
+	// It is appended to the stable system question-generation template.
+	CustomInstructions string `yaml:"custom_instructions,omitempty" json:"custom_instructions,omitempty"`
 }
 
 // Value implements the driver.Valuer interface
@@ -386,6 +515,35 @@ func (c *VLMConfig) Scan(value interface{}) error {
 	return json.Unmarshal(b, c)
 }
 
+// ASRConfig represents the ASR (Automatic Speech Recognition) configuration
+type ASRConfig struct {
+	Enabled  bool   `yaml:"enabled"  json:"enabled"`
+	ModelID  string `yaml:"model_id" json:"model_id"`
+	Language string `yaml:"language" json:"language"` // optional: language hint for transcription
+}
+
+// IsASREnabled checks if ASR is enabled with a valid model
+func (c ASRConfig) IsASREnabled() bool {
+	return c.Enabled && c.ModelID != ""
+}
+
+// Value implements the driver.Valuer interface, used to convert ASRConfig to database value
+func (c ASRConfig) Value() (driver.Value, error) {
+	return json.Marshal(c)
+}
+
+// Scan implements the sql.Scanner interface, used to convert database value to ASRConfig
+func (c *ASRConfig) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+	b, ok := value.([]byte)
+	if !ok {
+		return nil
+	}
+	return json.Unmarshal(b, c)
+}
+
 // ExtractConfig represents the extract configuration for a knowledge base
 type ExtractConfig struct {
 	Enabled   bool             `yaml:"enabled"   json:"enabled"`
@@ -393,6 +551,9 @@ type ExtractConfig struct {
 	Tags      []string         `yaml:"tags"      json:"tags,omitempty"`
 	Nodes     []*GraphNode     `yaml:"nodes"     json:"nodes,omitempty"`
 	Relations []*GraphRelation `yaml:"relations" json:"relations,omitempty"`
+	// CustomInstructions adds domain-specific extraction guidance while the
+	// system keeps ownership of the structured graph output protocol.
+	CustomInstructions string `yaml:"custom_instructions,omitempty" json:"custom_instructions,omitempty"`
 }
 
 // Value implements the driver.Valuer interface, used to convert ExtractConfig to database value
@@ -443,39 +604,184 @@ func (kb *KnowledgeBase) EnsureDefaults() {
 	if kb.Type == "" {
 		kb.Type = KnowledgeBaseTypeDocument
 	}
+	// Clear type-specific configs that don't belong
 	if kb.Type != KnowledgeBaseTypeFAQ {
 		kb.FAQConfig = nil
-		return
 	}
-	if kb.FAQConfig == nil {
-		kb.FAQConfig = &FAQConfig{
-			IndexMode:         FAQIndexModeQuestionAnswer,
-			QuestionIndexMode: FAQQuestionIndexModeCombined,
+	// Set defaults for FAQ
+	if kb.Type == KnowledgeBaseTypeFAQ {
+		if kb.FAQConfig == nil {
+			kb.FAQConfig = &FAQConfig{
+				IndexMode:         FAQIndexModeQuestionAnswer,
+				QuestionIndexMode: FAQQuestionIndexModeCombined,
+			}
+			return
 		}
-		return
+		if kb.FAQConfig.IndexMode == "" {
+			kb.FAQConfig.IndexMode = FAQIndexModeQuestionAnswer
+		}
+		if kb.FAQConfig.QuestionIndexMode == "" {
+			kb.FAQConfig.QuestionIndexMode = FAQQuestionIndexModeCombined
+		}
 	}
-	if kb.FAQConfig.IndexMode == "" {
-		kb.FAQConfig.IndexMode = FAQIndexModeQuestionAnswer
+
+	// Ensure IndexingStrategy has defaults.
+	// For existing rows where indexing_strategy is NULL, GORM Scan() returns
+	// DefaultIndexingStrategy() (vector+keyword=true). This block handles the
+	// case where a fresh struct was created in-memory without touching DB.
+	if kb.IndexingStrategy.IsZero() {
+		kb.IndexingStrategy = DefaultIndexingStrategy()
 	}
-	if kb.FAQConfig.QuestionIndexMode == "" {
-		kb.FAQConfig.QuestionIndexMode = FAQQuestionIndexModeCombined
+	// Sync legacy ExtractConfig.Enabled → IndexingStrategy.GraphEnabled
+	if kb.ExtractConfig != nil && kb.ExtractConfig.Enabled && !kb.IndexingStrategy.GraphEnabled {
+		kb.IndexingStrategy.GraphEnabled = true
 	}
 }
 
-// IsMultimodalEnabled 判断多模态是否启用（兼容新老版本配置）
-// 新版本：VLMConfig.IsEnabled()
-// 老版本：ChunkingConfig.EnableMultimodal
+// KBCapabilities describes the functional features a knowledge base exposes.
+// It is computed from the KB's configuration (IndexingStrategy, Type, WikiConfig, …)
+// and surfaced in the JSON representation of a KnowledgeBase so that the frontend
+// can filter / enable / disable KB options based on what the selected agent type needs.
+type KBCapabilities struct {
+	// Vector means semantic (embedding) search is indexed.
+	Vector bool `json:"vector"`
+	// Keyword means BM25 / sparse keyword search is indexed.
+	Keyword bool `json:"keyword"`
+	// Wiki means the wiki feature is enabled and authored pages exist / will be generated.
+	Wiki bool `json:"wiki"`
+	// Graph means knowledge-graph extraction is enabled.
+	Graph bool `json:"graph"`
+	// FAQ means the KB is a FAQ-type KB (Q/A pairs).
+	FAQ bool `json:"faq"`
+}
+
+// Capabilities returns the computed capability flags for this KB.
+// Safe to call on a nil KB (returns zero value).
+func (kb *KnowledgeBase) Capabilities() KBCapabilities {
+	if kb == nil {
+		return KBCapabilities{}
+	}
+	return KBCapabilities{
+		Vector:  kb.IsVectorEnabled(),
+		Keyword: kb.IsKeywordEnabled(),
+		Wiki:    kb.IsWikiEnabled(),
+		Graph:   kb.IsGraphEnabled(),
+		FAQ:     kb.Type == KnowledgeBaseTypeFAQ,
+	}
+}
+
+// MarshalJSON augments the default JSON encoding of KnowledgeBase with a computed
+// `capabilities` field so clients (agent editor) can filter KBs by feature.
+// It preserves all existing fields verbatim.
+func (kb *KnowledgeBase) MarshalJSON() ([]byte, error) {
+	type alias KnowledgeBase
+	aux := struct {
+		*alias
+		Capabilities KBCapabilities `json:"capabilities"`
+	}{
+		alias:        (*alias)(kb),
+		Capabilities: kb.Capabilities(),
+	}
+	return json.Marshal(aux)
+}
+
+// IsWikiEnabled checks if the wiki feature is enabled for this knowledge base.
+// Wiki enablement is the single source of truth on IndexingStrategy.WikiEnabled.
+func (kb *KnowledgeBase) IsWikiEnabled() bool {
+	if kb == nil {
+		return false
+	}
+	return kb.IndexingStrategy.WikiEnabled
+}
+
+// IsVectorEnabled checks if vector (semantic) search is enabled.
+func (kb *KnowledgeBase) IsVectorEnabled() bool {
+	return kb != nil && kb.IndexingStrategy.VectorEnabled
+}
+
+// IsKeywordEnabled checks if keyword (BM25) search is enabled.
+func (kb *KnowledgeBase) IsKeywordEnabled() bool {
+	return kb != nil && kb.IndexingStrategy.KeywordEnabled
+}
+
+// IsGraphEnabled checks if knowledge graph extraction is enabled.
+// Requires both the IndexingStrategy flag and a valid ExtractConfig.
+func (kb *KnowledgeBase) IsGraphEnabled() bool {
+	return kb != nil && kb.IndexingStrategy.GraphEnabled &&
+		kb.ExtractConfig != nil && kb.ExtractConfig.Enabled
+}
+
+// NeedsEmbeddingModel returns true if any enabled pipeline requires an embedding model.
+// Currently only vector and keyword search need embeddings.
+func (kb *KnowledgeBase) NeedsEmbeddingModel() bool {
+	return kb != nil && kb.IndexingStrategy.NeedsEmbedding()
+}
+
+// IsMultimodalEnabled 判断多模态是否启用，由 VLMConfig.IsEnabled() 决定。
 func (kb *KnowledgeBase) IsMultimodalEnabled() bool {
 	if kb == nil {
 		return false
 	}
-	// 新版本配置优先
-	if kb.VLMConfig.IsEnabled() {
-		return true
+	return kb.VLMConfig.IsEnabled()
+}
+
+// HasVectorStore reports whether the KB is bound to a DB-managed VectorStore
+// (as opposed to the tenant's env-store fallback).
+//
+// Safe to call on a nil receiver (returns false). Mirrors the convention of
+// other Is*Enabled / Capabilities accessors in this file.
+func (kb *KnowledgeBase) HasVectorStore() bool {
+	return kb != nil && kb.VectorStoreID != nil && *kb.VectorStoreID != ""
+}
+
+// Normalize folds the empty-string vector store id into nil so a single
+// representation reaches both the DB and the retrieve-engine factory, which
+// treats nil and `&""` as the same "no binding" signal. Idempotent and safe
+// to call repeatedly.
+//
+// Callers that accept unvalidated user input (CreateKnowledgeBase, async
+// payload decoders) should invoke this before persistence or validation.
+// Safe to call on a nil receiver (no-op).
+func (kb *KnowledgeBase) Normalize() {
+	if kb == nil {
+		return
 	}
-	// 兼容老版本：chunking_config 中的 enable_multimodal 字段
-	if kb.ChunkingConfig.EnableMultimodal {
-		return true
+	if kb.VectorStoreID != nil && *kb.VectorStoreID == "" {
+		kb.VectorStoreID = nil
 	}
-	return false
+}
+
+// SharesStoreWith reports whether two knowledge bases are bound to the same
+// vector store. Both env-fallback (nil) → true; both same UUID → true;
+// otherwise false. Safe to call when either receiver or argument is nil
+// (returns true iff both are nil).
+//
+// Empty-string VectorStoreID is treated as equivalent to nil so that rows
+// persisted by callers that did not run Normalize first (raw-SQL writes,
+// external migrations, ops scripts) still compare correctly. The alternative
+// — treating `&""` as a distinct binding — would reject otherwise valid
+// CopyKnowledgeBase clones with a confusing "different vector stores" 400.
+// This normalization is read-only; it does not mutate the receivers.
+//
+// Lives on *KnowledgeBase next to HasVectorStore() so the binding semantics
+// stay co-located with the type they describe.
+func (kb *KnowledgeBase) SharesStoreWith(other *KnowledgeBase) bool {
+	if kb == nil || other == nil {
+		return kb == other
+	}
+	a, b := kb.VectorStoreID, other.VectorStoreID
+	if a != nil && *a == "" {
+		a = nil
+	}
+	if b != nil && *b == "" {
+		b = nil
+	}
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	default:
+		return *a == *b
+	}
 }

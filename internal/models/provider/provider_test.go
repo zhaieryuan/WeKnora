@@ -36,7 +36,9 @@ func TestDetectProvider(t *testing.T) {
 		expected ProviderName
 	}{
 		{"https://api.openai.com/v1", ProviderOpenAI},
+		{"https://api.anthropic.com/v1", ProviderAnthropic},
 		{"https://openrouter.ai/api/v1", ProviderOpenRouter},
+		{"https://router.requesty.ai/v1", ProviderRequesty},
 		{"https://dashscope.aliyuncs.com/compatible-mode/v1", ProviderAliyun},
 		{"https://open.bigmodel.cn/api/paas/v4", ProviderZhipu},
 		{"https://api.deepseek.com/v1", ProviderDeepSeek},
@@ -48,6 +50,8 @@ func TestDetectProvider(t *testing.T) {
 		{"https://api.xiaomimimo.com/v1", ProviderMimo},
 		{"https://custom-endpoint.example.com/v1", ProviderGeneric},
 		{"http://localhost:11434/v1", ProviderGeneric},
+		{"https://integrate.api.nvidia.com/v1", ProviderNvidia},
+		{"https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking", ProviderNvidia},
 	}
 
 	for _, tt := range tests {
@@ -56,6 +60,36 @@ func TestDetectProvider(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestAnthropicProviderValidation(t *testing.T) {
+	p := &AnthropicProvider{}
+
+	t.Run("valid config", func(t *testing.T) {
+		config := &Config{
+			APIKey:    "sk-ant-test",
+			ModelName: "claude-sonnet-4-5",
+		}
+		err := p.ValidateConfig(config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("missing API key", func(t *testing.T) {
+		config := &Config{
+			ModelName: "claude-sonnet-4-5",
+		}
+		err := p.ValidateConfig(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "API key")
+	})
+
+	t.Run("info", func(t *testing.T) {
+		info := p.Info()
+		assert.Equal(t, ProviderAnthropic, info.Name)
+		assert.Equal(t, AnthropicBaseURL, info.GetDefaultURL(types.ModelTypeKnowledgeQA))
+		assert.Contains(t, info.ModelTypes, types.ModelTypeKnowledgeQA)
+		assert.True(t, info.RequiresAuth)
+	})
 }
 
 func TestOpenAIProviderValidation(t *testing.T) {
@@ -126,6 +160,46 @@ func TestAliyunModelDetection(t *testing.T) {
 	})
 }
 
+func TestMiniMaxProviderValidation(t *testing.T) {
+	p := &MiniMaxProvider{}
+
+	t.Run("valid config", func(t *testing.T) {
+		config := &Config{
+			APIKey:    "test-key",
+			ModelName: "MiniMax-M2.7",
+		}
+		err := p.ValidateConfig(config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("missing API key", func(t *testing.T) {
+		config := &Config{
+			ModelName: "MiniMax-M2.7",
+		}
+		err := p.ValidateConfig(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "API key")
+	})
+
+	t.Run("missing model name", func(t *testing.T) {
+		config := &Config{
+			APIKey: "test-key",
+		}
+		err := p.ValidateConfig(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "model name")
+	})
+
+	t.Run("info", func(t *testing.T) {
+		info := p.Info()
+		assert.Equal(t, ProviderMiniMax, info.Name)
+		assert.Equal(t, "MiniMax", info.DisplayName)
+		assert.Contains(t, info.ModelTypes, types.ModelTypeKnowledgeQA)
+		assert.True(t, info.RequiresAuth)
+		assert.Contains(t, info.Description, "M2.7")
+	})
+}
+
 func TestZhipuProviderValidation(t *testing.T) {
 	p := &ZhipuProvider{}
 
@@ -146,6 +220,38 @@ func TestZhipuProviderValidation(t *testing.T) {
 	})
 }
 
+func TestRequestyProviderValidation(t *testing.T) {
+	p := &RequestyProvider{}
+
+	t.Run("valid config", func(t *testing.T) {
+		config := &Config{
+			APIKey:    "test-key",
+			ModelName: "openai/gpt-4o-mini",
+		}
+		err := p.ValidateConfig(config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("missing API key", func(t *testing.T) {
+		config := &Config{
+			ModelName: "openai/gpt-4o-mini",
+		}
+		err := p.ValidateConfig(config)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "API key")
+	})
+
+	t.Run("info", func(t *testing.T) {
+		info := p.Info()
+		assert.Equal(t, ProviderRequesty, info.Name)
+		assert.Equal(t, "Requesty", info.DisplayName)
+		assert.Equal(t, RequestyBaseURL, info.GetDefaultURL(types.ModelTypeKnowledgeQA))
+		assert.Equal(t, RequestyBaseURL, info.GetDefaultURL(types.ModelTypeEmbedding))
+		assert.Contains(t, info.ModelTypes, types.ModelTypeKnowledgeQA)
+		assert.True(t, info.RequiresAuth)
+	})
+}
+
 func TestListByModelType(t *testing.T) {
 	t.Run("chat models", func(t *testing.T) {
 		providers := ListByModelType(types.ModelTypeKnowledgeQA)
@@ -158,13 +264,50 @@ func TestListByModelType(t *testing.T) {
 		providers := ListByModelType(types.ModelTypeRerank)
 		assert.NotEmpty(t, providers)
 		// Check that Aliyun supports rerank
-		found := false
+		foundAliyun := false
+		foundLKEAP := false
 		for _, p := range providers {
 			if p.Name == ProviderAliyun {
+				foundAliyun = true
+			}
+			if p.Name == ProviderLKEAP {
+				foundLKEAP = true
+				assert.Equal(t, LKEAPRerankBaseURL, p.GetDefaultURL(types.ModelTypeRerank))
+			}
+		}
+		assert.True(t, foundAliyun, "Aliyun should support rerank")
+		assert.True(t, foundLKEAP, "LKEAP should support rerank")
+	})
+
+	t.Run("embedding models include openrouter", func(t *testing.T) {
+		providers := ListByModelType(types.ModelTypeEmbedding)
+		assert.NotEmpty(t, providers)
+
+		found := false
+		for _, p := range providers {
+			if p.Name == ProviderOpenRouter {
 				found = true
+				assert.Equal(t, OpenRouterBaseURL, p.GetDefaultURL(types.ModelTypeEmbedding))
 				break
 			}
 		}
-		assert.True(t, found, "Aliyun should support rerank")
+
+		assert.True(t, found, "OpenRouter should support embedding")
+	})
+
+	t.Run("embedding models include gemini", func(t *testing.T) {
+		providers := ListByModelType(types.ModelTypeEmbedding)
+		assert.NotEmpty(t, providers)
+
+		found := false
+		for _, p := range providers {
+			if p.Name == ProviderGemini {
+				found = true
+				assert.Equal(t, GeminiBaseURL, p.GetDefaultURL(types.ModelTypeEmbedding))
+				break
+			}
+		}
+
+		assert.True(t, found, "Gemini should support embedding via the native Gemini API")
 	})
 }

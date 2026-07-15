@@ -1,10 +1,43 @@
 import { get, post, put, del } from "../../utils/request";
 
 // 智能体配置
+// 智能推理下的智能体类型预设 ID
+// 'rag-qa'       : 经典文档/FAQ 分块 RAG
+// 'wiki-qa'      : Wiki 图谱导航问答
+// 'hybrid-rag-wiki': Wiki + 分块混合检索
+// 'custom'       : 完全自定义（不应用预设）
+export type AgentType = 'rag-qa' | 'wiki-qa' | 'hybrid-rag-wiki' | 'data-analysis' | 'custom';
+
+export interface QuestionSuggestionConfig {
+  starters: {
+    enabled: boolean;
+    mode: 'curated' | 'knowledge' | 'hybrid';
+    items: string[];
+    count: number;
+  };
+  follow_ups: {
+    enabled: boolean;
+    mode: 'generated' | 'knowledge' | 'hybrid';
+    count: number;
+    model_id?: string;
+    additional_instruction?: string;
+    categories: Array<'clarify' | 'deepen' | 'action'>;
+    max_context_turns: number;
+    suppress_on_fallback: boolean;
+    suppress_when_answer_asks_question: boolean;
+    knowledge_fallback: boolean;
+    allow_regenerate: boolean;
+  };
+}
+
 export interface CustomAgentConfig {
   // ===== 基础设置 =====
   agent_mode?: 'quick-answer' | 'smart-reasoning';  // 运行模式：quick-answer=RAG模式, smart-reasoning=ReAct Agent模式
+  // 智能推理模式下的类型预设，用于一键应用"系统提示词 + 工具 + KB 兼容性"组合
+  // 仅在 agent_mode === 'smart-reasoning' 时生效；quick-answer 模式忽略
+  agent_type?: AgentType;
   system_prompt?: string;           // 统一系统提示词（使用 {{web_search_status}} 占位符动态控制行为）
+  system_prompt_id?: string;        // 引用的 prompt template ID（预设会填入此字段）
   context_template?: string;        // 上下文模板（普通模式）
 
   // ===== 模型设置 =====
@@ -12,14 +45,19 @@ export interface CustomAgentConfig {
   rerank_model_id?: string;         // ReRank 模型 ID
   temperature?: number;
   max_completion_tokens?: number;   // 最大生成token数（普通模式）
+  thinking?: boolean;                      // 是否启用思考模式（支持扩展思考的模型）
 
   // ===== Agent模式设置 =====
   max_iterations?: number;          // 最大迭代次数
+  llm_call_timeout?: number;        // LLM调用超时时间（秒）
   allowed_tools?: string[];         // 允许的工具
   reflection_enabled?: boolean;     // 是否启用反思
   // MCP服务选择模式：all=全部启用的MCP服务, selected=指定服务, none=不使用MCP
   mcp_selection_mode?: 'all' | 'selected' | 'none';
   mcp_services?: string[];          // 选择的MCP服务ID列表
+  // 对话中触发 OAuth 授权时的等待超时（秒）：到点后自动跳过授权提示。
+  // <=0 时使用服务端默认超时。仅对使用 OAuth 的 MCP 服务生效。
+  mcp_auth_wait_timeout?: number;
 
   // ===== Skills设置（仅Agent模式）=====
   // Skills选择模式：all=全部预装, selected=指定, none=不使用
@@ -35,6 +73,13 @@ export interface CustomAgentConfig {
   // false: 根据 kb_selection_mode 自动检索知识库
   retrieve_kb_only_when_mentioned?: boolean;
 
+  // ===== 图片上传/多模态设置 =====
+  image_upload_enabled?: boolean;    // 是否启用图片上传（默认: false）
+  vlm_model_id?: string;            // VLM模型ID（图片分析用）
+  image_storage_provider?: string;   // 图片存储提供商
+  audio_upload_enabled?: boolean;    // 是否启用音频上传/ASR转录（默认: false）
+  asr_model_id?: string;            // ASR模型ID（音频转录用）
+
   // ===== 文件类型限制 =====
   // 支持的文件类型（如 ["csv", "xlsx", "xls"]）
   // 为空表示支持所有文件类型
@@ -42,6 +87,7 @@ export interface CustomAgentConfig {
 
   // ===== 网络搜索设置 =====
   web_search_enabled?: boolean;
+  web_search_provider_id?: string;
   web_search_max_results?: number;
 
   // ===== 多轮对话设置 =====
@@ -63,10 +109,12 @@ export interface CustomAgentConfig {
   fallback_strategy?: 'fixed' | 'model'; // 兜底策略
   fallback_response?: string;       // 固定兜底回复
   fallback_prompt?: string;         // 兜底提示词（模型生成时）
+  // 意图提示词：非检索意图（问候、闲聊等）时覆盖主系统提示词
+  intent_prompts?: Record<string, string>;
 
   // ===== 已废弃字段（保留兼容）=====
   welcome_message?: string;
-  suggested_prompts?: string[];
+  question_suggestions?: QuestionSuggestionConfig;
 }
 
 // 智能体
@@ -78,6 +126,8 @@ export interface CustomAgent {
   is_builtin: boolean;
   tenant_id?: number;
   created_by?: string;
+  // creator_name 由后端 list 接口批量回填，仅用于列表卡片来源徽章。
+  creator_name?: string;
   config: CustomAgentConfig;
   created_at?: string;
   updated_at?: string;
@@ -113,9 +163,18 @@ export const BUILTIN_AGENT_NORMAL_ID = BUILTIN_QUICK_ANSWER_ID;
 export const BUILTIN_AGENT_AGENT_ID = BUILTIN_SMART_REASONING_ID;
 
 // 获取智能体列表（包括内置智能体）
-// disabled_own_agent_ids: 当前租户在对话下拉中停用的「我的」智能体 ID，仅影响本租户
-export function listAgents() {
-  return get<{ data: CustomAgent[]; disabled_own_agent_ids?: string[] }>('/api/v1/agents');
+// disabled_own_agent_ids: 当前空间在对话下拉中停用的「我的」智能体 ID，仅影响本空间
+export function listAgents(params?: {
+  /**
+   * Optional creator filter; mirrors listKnowledgeBases. Built-in agents
+   * (is_builtin=true) are always returned regardless of this filter so
+   * the conversation dropdown never silently loses quick-answer /
+   * smart-reasoning when a user picks "Created by me".
+   */
+  creator?: 'all' | 'mine' | 'others';
+}) {
+  const qs = params?.creator && params.creator !== 'all' ? `?creator=${params.creator}` : '';
+  return get<{ data: CustomAgent[]; disabled_own_agent_ids?: string[] }>(`/api/v1/agents${qs}`);
 }
 
 // 获取智能体详情
@@ -169,4 +228,160 @@ export interface PlaceholdersResponse {
 // 获取占位符定义
 export function getPlaceholders() {
   return get<{ data: PlaceholdersResponse }>('/api/v1/agents/placeholders');
+}
+
+// ===== 智能体类型预设 =====
+
+// 后端 kb_filter 结构（见 internal/types/agent_type_preset.go）
+export interface AgentTypeKBFilter {
+  any_of?: string[];   // KB 至少拥有其一
+  all_of?: string[];   // KB 必须全部拥有
+  none_of?: string[];  // KB 必须全部不拥有
+}
+
+// KB 能力标签（后端 types.KBCapabilities 的 JSON）
+export interface KBCapabilities {
+  vector: boolean;
+  keyword: boolean;
+  wiki: boolean;
+  graph: boolean;
+  faq: boolean;
+}
+
+// 预设的"自动填充"配置载荷：仅包含被预设覆盖的字段；其他字段不动
+export interface AgentTypePresetConfig {
+  system_prompt_id?: string;
+  temperature?: number;
+  max_iterations?: number;
+  allowed_tools?: string[];
+  retain_retrieval_history?: boolean;
+  faq_priority_enabled?: boolean;
+  web_search_enabled?: boolean;
+  supported_file_types?: string[];
+  kb_selection_mode?: 'all' | 'selected' | 'none';
+}
+
+export interface AgentTypePresetI18n {
+  label: string;
+  description: string;
+}
+
+export interface AgentTypePreset {
+  id: AgentType;
+  i18n: Record<string, AgentTypePresetI18n>;
+  config?: AgentTypePresetConfig;     // 为空表示"自定义"类型（无预设）
+  kb_filter?: AgentTypeKBFilter;      // 为空表示所有 KB 可选
+}
+
+// 拉取类型预设列表（编辑器用）
+export function getAgentTypePresets() {
+  return get<{ data: AgentTypePreset[] }>('/api/v1/agents/type-presets');
+}
+
+// ===== IM渠道 =====
+
+export interface IMChannel {
+  id: string;
+  tenant_id?: number;
+  agent_id: string;
+  platform: 'wecom' | 'feishu' | 'slack' | 'telegram' | 'dingtalk' | 'mattermost' | 'wechat' | 'qqbot';
+  name: string;
+  enabled: boolean;
+  mode: 'webhook' | 'websocket' | 'longpoll';
+  output_mode: 'stream' | 'full';
+  session_mode?: 'user' | 'thread';
+  knowledge_base_id?: string;
+  credentials: Record<string, any>;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export function listIMChannels(agentId: string) {
+  return get<{ data: IMChannel[] }>(`/api/v1/agents/${agentId}/im-channels`);
+}
+
+// Tenant-wide overview row. Credentials are intentionally omitted — use
+// listIMChannels(agentId) when you need to edit a specific channel.
+export interface IMChannelOverview {
+  id: string;
+  tenant_id: number;
+  agent_id: string;
+  agent_name: string; // empty string for built-in agents
+  platform: IMChannel['platform'];
+  name: string;
+  enabled: boolean;
+  mode: IMChannel['mode'];
+  output_mode: IMChannel['output_mode'];
+  session_mode?: IMChannel['session_mode'];
+  bot_identity: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listAllIMChannels() {
+  return get<{ data: IMChannelOverview[] }>('/api/v1/im-channels');
+}
+
+export function createIMChannel(agentId: string, data: Partial<IMChannel>) {
+  return post<{ data: IMChannel }>(`/api/v1/agents/${agentId}/im-channels`, data);
+}
+
+export function updateIMChannel(id: string, data: Partial<IMChannel>) {
+  return put<{ data: IMChannel }>(`/api/v1/im-channels/${id}`, data);
+}
+
+export function deleteIMChannel(id: string) {
+  return del<{ success: boolean }>(`/api/v1/im-channels/${id}`);
+}
+
+export function toggleIMChannel(id: string) {
+  return post<{ data: IMChannel }>(`/api/v1/im-channels/${id}/toggle`);
+}
+
+// ===== 推荐问题 =====
+
+// 推荐问题
+export interface SuggestedQuestion {
+  question: string;
+  source: 'faq' | 'document' | 'agent_config' | 'wiki';
+  knowledge_base_id?: string;
+}
+
+// 获取智能体推荐问题
+// 根据智能体关联的知识库范围返回推荐问题，用于前端对话面板快捷提问
+export function getSuggestedQuestions(
+  agentId: string,
+  params?: { knowledge_base_ids?: string[]; knowledge_ids?: string[]; tag_ids?: string[]; limit?: number }
+) {
+  const query = new URLSearchParams();
+  if (params?.knowledge_base_ids?.length) query.set('knowledge_base_ids', params.knowledge_base_ids.join(','));
+  if (params?.knowledge_ids?.length) query.set('knowledge_ids', params.knowledge_ids.join(','));
+  if (params?.tag_ids?.length) query.set('tag_ids', params.tag_ids.join(','));
+  if (params?.limit) query.set('limit', String(params.limit));
+  const qs = query.toString();
+  return get<{ data: { questions: SuggestedQuestion[] } }>(`/api/v1/agents/${agentId}/suggested-questions${qs ? '?' + qs : ''}`);
+}
+// ===== WeChat QR Code Login =====
+
+export interface WeChatQRCodeResult {
+  qrcode_url: string;
+  qrcode: string;
+}
+
+export interface WeChatQRCodeStatus {
+  status: 'wait' | 'scaned' | 'confirmed' | 'expired';
+  credentials?: {
+    bot_token: string;
+    ilink_bot_id: string;
+    ilink_user_id: string;
+  };
+  baseurl?: string;
+}
+
+export function getWeChatQRCode() {
+  return post<{ data: WeChatQRCodeResult }>('/api/v1/wechat/qrcode');
+}
+
+export function pollWeChatQRCodeStatus(qrcode: string) {
+  return post<{ data: WeChatQRCodeStatus }>('/api/v1/wechat/qrcode/status', { qrcode });
 }

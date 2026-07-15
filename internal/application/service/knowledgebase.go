@@ -4,15 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"slices"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/datasource"
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
-	"github.com/Tencent/WeKnora/internal/models/embedding"
+	"github.com/Tencent/WeKnora/internal/storageallowlist"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 )
@@ -22,17 +27,22 @@ var ErrInvalidTenantID = errors.New("invalid tenant ID")
 
 // knowledgeBaseService implements the knowledge base service interface
 type knowledgeBaseService struct {
-	repo           interfaces.KnowledgeBaseRepository
-	kgRepo         interfaces.KnowledgeRepository
-	chunkRepo      interfaces.ChunkRepository
-	shareRepo      interfaces.KBShareRepository
-	kbShareService interfaces.KBShareService
-	modelService   interfaces.ModelService
-	retrieveEngine interfaces.RetrieveEngineRegistry
-	tenantRepo     interfaces.TenantRepository
-	fileSvc        interfaces.FileService
-	graphEngine    interfaces.RetrieveGraphRepository
-	asynqClient    interfaces.TaskEnqueuer
+	repo            interfaces.KnowledgeBaseRepository
+	kgRepo          interfaces.KnowledgeRepository
+	chunkRepo       interfaces.ChunkRepository
+	shareRepo       interfaces.KBShareRepository
+	kbShareService  interfaces.KBShareService
+	modelService    interfaces.ModelService
+	retrieveEngine  interfaces.RetrieveEngineRegistry
+	ownership       retriever.TenantStoreOwnership
+	tenantRepo      interfaces.TenantRepository
+	fileSvc         interfaces.FileService
+	storageResolver interfaces.StorageBackendResolver
+	graphEngine     interfaces.RetrieveGraphRepository
+	asynqClient     interfaces.TaskEnqueuer
+	dsRepo          interfaces.DataSourceRepository
+	syncLogRepo     interfaces.SyncLogRepository
+	dsScheduler     *datasource.Scheduler
 }
 
 // NewKnowledgeBaseService creates a new knowledge base service
@@ -43,23 +53,33 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 	kbShareService interfaces.KBShareService,
 	modelService interfaces.ModelService,
 	retrieveEngine interfaces.RetrieveEngineRegistry,
+	ownership retriever.TenantStoreOwnership,
 	tenantRepo interfaces.TenantRepository,
 	fileSvc interfaces.FileService,
+	storageResolver interfaces.StorageBackendResolver,
 	graphEngine interfaces.RetrieveGraphRepository,
 	asynqClient interfaces.TaskEnqueuer,
+	dsRepo interfaces.DataSourceRepository,
+	syncLogRepo interfaces.SyncLogRepository,
+	dsScheduler *datasource.Scheduler,
 ) interfaces.KnowledgeBaseService {
 	return &knowledgeBaseService{
-		repo:           repo,
-		kgRepo:         kgRepo,
-		chunkRepo:      chunkRepo,
-		shareRepo:      shareRepo,
-		kbShareService: kbShareService,
-		modelService:   modelService,
-		retrieveEngine: retrieveEngine,
-		tenantRepo:     tenantRepo,
-		fileSvc:        fileSvc,
-		graphEngine:    graphEngine,
-		asynqClient:    asynqClient,
+		repo:            repo,
+		kgRepo:          kgRepo,
+		chunkRepo:       chunkRepo,
+		shareRepo:       shareRepo,
+		kbShareService:  kbShareService,
+		modelService:    modelService,
+		retrieveEngine:  retrieveEngine,
+		ownership:       ownership,
+		tenantRepo:      tenantRepo,
+		fileSvc:         fileSvc,
+		storageResolver: storageResolver,
+		graphEngine:     graphEngine,
+		asynqClient:     asynqClient,
+		dsRepo:          dsRepo,
+		syncLogRepo:     syncLogRepo,
+		dsScheduler:     dsScheduler,
 	}
 }
 
@@ -73,7 +93,12 @@ func (s *knowledgeBaseService) GetRepository() interfaces.KnowledgeBaseRepositor
 	return s.repo
 }
 
-// CreateKnowledgeBase creates a new knowledge base
+// CreateKnowledgeBase creates a new knowledge base.
+//
+// When VectorStoreID is set, the binding is validated against the caller's
+// tenant scope and the engine registry before persisting. A nil or
+// empty-string VectorStoreID is normalized to nil ("use the tenant's
+// effective engines") to match the retrieve-engine factory's pre-condition.
 func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 	kb *types.KnowledgeBase,
 ) (*types.KnowledgeBase, error) {
@@ -84,7 +109,38 @@ func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 	kb.CreatedAt = time.Now()
 	kb.TenantID = types.MustTenantIDFromContext(ctx)
 	kb.UpdatedAt = time.Now()
+	// Record the creator so RBAC's RequireOwnershipOrRole can let
+	// Contributors edit their own KBs without granting them tenant-wide
+	// edit rights. The X-API-Key auth path attaches a synthetic
+	// `system-<tenantID>` user; we deliberately skip those so the KB
+	// stays tenant-owned (CreatorID == ""), which matches the original
+	// API-key semantics (any human Admin can manage it) and prevents a
+	// later "list KBs by creator" feature from surfacing rows nobody can
+	// re-attribute.
+	if uid, ok := types.UserIDFromContext(ctx); ok && !types.IsSyntheticUserID(uid) {
+		kb.CreatorID = uid
+	}
 	kb.EnsureDefaults()
+	applyTenantDefaultStorageProvider(ctx, kb)
+	if err := s.applyAndValidateStorageBackend(ctx, kb); err != nil {
+		return nil, err
+	}
+
+	// Fold empty-string vector_store_id into nil so this path and the
+	// retrieve-engine factory's pre-condition share a single representation.
+	wasEmpty := kb.VectorStoreID != nil && *kb.VectorStoreID == ""
+	kb.Normalize()
+	if wasEmpty {
+		logger.Debugf(ctx,
+			"[kb.create] empty vector_store_id normalized to nil for tenant=%d",
+			kb.TenantID)
+	}
+
+	if kb.HasVectorStore() {
+		if err := s.validateVectorStoreBinding(ctx, kb.TenantID, *kb.VectorStoreID); err != nil {
+			return nil, err
+		}
+	}
 
 	logger.Infof(ctx, "Creating knowledge base, ID: %s, tenant ID: %d, name: %s", kb.ID, kb.TenantID, kb.Name)
 
@@ -98,6 +154,114 @@ func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 
 	logger.Infof(ctx, "Knowledge base created successfully, ID: %s, name: %s", kb.ID, kb.Name)
 	return kb, nil
+}
+
+func (s *knowledgeBaseService) applyAndValidateStorageBackend(ctx context.Context, kb *types.KnowledgeBase) error {
+	if s.storageResolver == nil || kb == nil {
+		return nil
+	}
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		return apperrors.NewBadRequestError("workspace context missing")
+	}
+	id := ""
+	if kb.StorageBackendID != nil {
+		id = strings.TrimSpace(*kb.StorageBackendID)
+	}
+	provider := kb.GetStorageProvider()
+	// A newly created KB without an explicit instance follows the concrete
+	// tenant default. The legacy provider is only a fallback for workspaces
+	// that have not been migrated yet.
+	if id == "" && tenant.DefaultStorageBackendID != nil && strings.TrimSpace(*tenant.DefaultStorageBackendID) != "" {
+		provider = ""
+	}
+	backend, err := s.storageResolver.ResolveBackend(ctx, tenant, id, provider)
+	if err != nil {
+		return apperrors.NewBadRequestError("storage backend is unavailable").WithDetails(err.Error())
+	}
+	if backend == nil {
+		return nil
+	}
+	kb.StorageBackendID = &backend.ID
+	kb.SetStorageProvider(backend.Provider)
+	return nil
+}
+
+// applyTenantDefaultStorageProvider fills an empty KB storage provider from the
+// tenant's global default (Settings → Storage engine). Frontend should send the
+// same value; this keeps API clients and legacy UIs consistent.
+func applyTenantDefaultStorageProvider(ctx context.Context, kb *types.KnowledgeBase) {
+	if kb == nil || strings.TrimSpace(kb.GetStorageProvider()) != "" {
+		return
+	}
+	tenant, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	provider := ""
+	if tenant != nil && tenant.StorageEngineConfig != nil {
+		provider = strings.ToLower(strings.TrimSpace(tenant.StorageEngineConfig.DefaultProvider))
+	}
+	if provider == "" || !storageallowlist.IsAllowed(provider) {
+		provider = storageallowlist.FirstAllowed()
+	}
+	if provider == "" {
+		return
+	}
+	kb.SetStorageProvider(provider)
+}
+
+// validateVectorStoreBinding routes through retriever.VerifyBinding so the
+// ownership + registry sentinel hierarchy stays the single source of truth.
+// The service layer's responsibility is to:
+//
+//  1. fast-reject malformed UUIDs (cheap pre-flight that also avoids a DB
+//     round trip for type-confusion inputs like "' OR 1=1 --"),
+//  2. translate retriever sentinels into user-facing AppErrors with
+//     generic messages and the typed error codes.
+//
+// UUID parse failures map to the same "vector store not found" message as
+// cross-tenant attempts to avoid an enumeration oracle that distinguishes
+// "malformed input" from "non-existent UUID".
+func (s *knowledgeBaseService) validateVectorStoreBinding(
+	ctx context.Context, tenantID uint64, storeID string,
+) error {
+	sanitized := secutils.SanitizeForLog(storeID)
+
+	if _, err := uuid.Parse(storeID); err != nil {
+		logger.WarnWithFields(ctx, logger.Fields{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "malformed vector_store_id",
+		}, "[kb.create] vector store id is not a valid UUID")
+		return apperrors.NewVectorStoreBindingInvalidError("vector store not found")
+	}
+
+	switch err := retriever.VerifyBinding(
+		ctx, s.retrieveEngine, s.ownership, tenantID, storeID,
+	); {
+	case err == nil:
+		return nil
+	case errors.Is(err, retriever.ErrVectorStoreForbidden):
+		logger.WarnWithFields(ctx, logger.Fields{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "cross-tenant or unknown store",
+		}, "[kb.create] vector store not owned by tenant")
+		return apperrors.NewVectorStoreBindingInvalidError("vector store not found")
+	case errors.Is(err, retriever.ErrVectorStoreNotFound):
+		logger.WarnWithFields(ctx, logger.Fields{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "store registered in DB but missing in registry",
+		}, "[kb.create] vector store currently unavailable")
+		return apperrors.NewVectorStoreUnavailableError(
+			"vector store is currently unavailable; check its connection configuration")
+	default:
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "binding verification failed",
+		})
+		return apperrors.NewInternalServerError("failed to verify vector store binding")
+	}
 }
 
 // GetKnowledgeBaseByID retrieves a knowledge base by its ID
@@ -209,6 +373,14 @@ func (s *knowledgeBaseService) ListKnowledgeBases(ctx context.Context) ([]*types
 			kb.ProcessingCount = processingCount
 		}
 	}
+
+	// Per-user pin stamping + ordering. The "main" list view is the
+	// only path that needs to honour the caller's personal pin set;
+	// agent/share/IM callers go through ListKnowledgeBasesByTenantID
+	// which also enriches but keys off the user in their own context.
+	if userID, ok := types.UserIDFromContext(ctx); ok && userID != "" {
+		s.applyUserKBPins(ctx, tenantID, userID, kbs)
+	}
 	return kbs, nil
 }
 
@@ -238,6 +410,15 @@ func (s *knowledgeBaseService) ListKnowledgeBasesByTenantID(ctx context.Context,
 			kb.ProcessingCount = processingCount
 		}
 	}
+
+	// Stamp pin state from the caller's perspective. The tenantID
+	// argument may not match the caller's own tenant (this method is
+	// also used to list a shared-agent's source-tenant KBs); we still
+	// scope user_kb_pins by `tenantID` since a pin tied to one tenant
+	// shouldn't surface when browsing another tenant's KBs.
+	if userID, ok := types.UserIDFromContext(ctx); ok && userID != "" {
+		s.applyUserKBPins(ctx, tenantID, userID, kbs)
+	}
 	return kbs, nil
 }
 
@@ -265,7 +446,23 @@ func (s *knowledgeBaseService) FillKnowledgeBaseCounts(ctx context.Context, kb *
 	return nil
 }
 
-// UpdateKnowledgeBase updates a knowledge base's properties
+// UpdateKnowledgeBase updates a knowledge base's mutable properties.
+//
+// IMPORTANT — vector_store_id immutability contract:
+// The vector_store_id binding is deliberately not accepted by this method.
+// Two layers enforce immutability:
+//
+//  1. ORM layer: the GORM tag `<-:create` on KnowledgeBase.VectorStoreID
+//     makes every UPDATE path (Save / Updates / Select-Updates) a no-op for
+//     that column. Verified by repository/knowledgebase_sqlite_test.go.
+//  2. Service layer: this method intentionally omits VectorStoreID from its
+//     parameter list, and the matching handler DTO UpdateKnowledgeBaseRequest
+//     omits the field as well. A reflection-based regression test
+//     (handler/knowledgebase_request_test.go) fails if either DTO field
+//     is added back, alerting future maintainers.
+//
+// Any future cross-store rebind workflow must use raw SQL through a
+// dedicated repository method — the only sanctioned write path post-creation.
 func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 	id string,
 	name string,
@@ -291,11 +488,33 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 	// Update the knowledge base properties
 	kb.Name = name
 	kb.Description = description
-	kb.ChunkingConfig = config.ChunkingConfig
-	kb.ImageProcessingConfig = config.ImageProcessingConfig
-	// Update FAQ config if provided
-	if config.FAQConfig != nil {
-		kb.FAQConfig = config.FAQConfig
+	if config != nil {
+		kb.ChunkingConfig = config.ChunkingConfig
+		kb.ImageProcessingConfig = config.ImageProcessingConfig
+		if config.FAQConfig != nil {
+			kb.FAQConfig = config.FAQConfig
+		}
+		if config.WikiConfig != nil {
+			kb.WikiConfig = config.WikiConfig
+		}
+		// Update indexing strategy — syncs to ExtractConfig for backward compat
+		if config.IndexingStrategy != nil {
+			if !config.IndexingStrategy.HasAnyIndexing() {
+				return nil, errors.New("at least one indexing strategy must be enabled")
+			}
+			kb.IndexingStrategy = *config.IndexingStrategy
+			// Ensure WikiConfig exists when wiki indexing is enabled so that
+			// wiki-specific tunables (synthesis model, granularity, …) have a home.
+			if kb.WikiConfig == nil && config.IndexingStrategy.WikiEnabled {
+				kb.WikiConfig = &types.WikiConfig{}
+			}
+			// Sync GraphEnabled → ExtractConfig
+			if kb.ExtractConfig != nil {
+				kb.ExtractConfig.Enabled = config.IndexingStrategy.GraphEnabled
+			} else if config.IndexingStrategy.GraphEnabled {
+				kb.ExtractConfig = &types.ExtractConfig{Enabled: true}
+			}
+		}
 	}
 	kb.UpdatedAt = time.Now()
 	kb.EnsureDefaults()
@@ -312,21 +531,125 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 	return kb, nil
 }
 
-// TogglePinKnowledgeBase toggles the pin status of a knowledge base
-func (s *knowledgeBaseService) TogglePinKnowledgeBase(ctx context.Context, id string) (*types.KnowledgeBase, error) {
+// TogglePinKnowledgeBase toggles whether the calling user has pinned
+// this knowledge base. Pin state is per-(user, kb) as of migration
+// 000050; previously this method flipped a tenant-wide column on the
+// KB row which broke down under RBAC (only Admin/creator could pin,
+// and the pin reordered the list for everyone in the tenant). The
+// public signature is unchanged so the HTTP handler / CLI / SDK don't
+// move.
+//
+// The KB still has to belong to the caller's tenant — the route is
+// already gated behind KBAccessRead, but we re-check via
+// GetKnowledgeBaseByIDAndTenant so a stale param survives a tenant
+// switch cleanly.
+func (s *knowledgeBaseService) TogglePinKnowledgeBase(
+	ctx context.Context, id string,
+) (*types.KnowledgeBase, error) {
 	if id == "" {
 		return nil, errors.New("knowledge base ID cannot be empty")
 	}
 	tenantID := types.MustTenantIDFromContext(ctx)
-	kb, err := s.repo.TogglePinKnowledgeBase(ctx, id, tenantID)
+	userID, ok := types.UserIDFromContext(ctx)
+	if !ok || userID == "" {
+		// API-key callers without a user identity can't have a personal
+		// pin set. We surface this rather than silently flipping a
+		// shared-tenant flag like the old behaviour.
+		return nil, errors.New("pin requires an authenticated user")
+	}
+
+	// Look the KB up without a tenant filter: the route's KBAccessRead
+	// guard already validated that this caller can see this KB (own,
+	// org-shared, or agent-shared). Filtering by the caller's tenant
+	// here would 404 every legitimate pin against a shared KB whose
+	// owning tenant differs from the caller's active tenant.
+	kb, err := s.repo.GetKnowledgeBaseByID(ctx, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"knowledge_base_id": id,
+			"tenant_id":         tenantID,
 		})
 		return nil, err
 	}
-	logger.Infof(ctx, "Knowledge base pin toggled, ID: %s, is_pinned: %v", id, kb.IsPinned)
+
+	// Read current pin state to decide direction. ListUserKBPinIDs is
+	// already optimised for the "many KBs at once" path; for a single-id
+	// check the round-trip is acceptable and avoids leaking a second
+	// repository method just for this.
+	pins, err := s.repo.ListUserKBPinIDs(ctx, tenantID, userID)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_base_id": id,
+			"tenant_id":         tenantID,
+			"user_id":           userID,
+		})
+		return nil, err
+	}
+	_, currentlyPinned := pins[id]
+
+	pinnedAt, err := s.repo.SetUserKBPin(ctx, tenantID, userID, id, !currentlyPinned)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_base_id": id,
+			"tenant_id":         tenantID,
+			"user_id":           userID,
+			"target_pinned":     !currentlyPinned,
+		})
+		return nil, err
+	}
+
+	kb.EnsureDefaults()
+	kb.IsPinned = !currentlyPinned
+	kb.PinnedAt = pinnedAt
+	logger.Infof(ctx, "Knowledge base pin toggled, ID: %s, user: %s, is_pinned: %v",
+		id, userID, kb.IsPinned)
 	return kb, nil
+}
+
+// applyUserKBPins stamps IsPinned / PinnedAt onto each KB in the slice
+// from the caller's perspective and sorts the slice so pinned rows
+// float to the top (newest pin first, ties broken by created_at desc).
+// Safe to call with an empty userID (no-op stamp; default sort by
+// created_at preserved).
+func (s *knowledgeBaseService) applyUserKBPins(
+	ctx context.Context, tenantID uint64, userID string, kbs []*types.KnowledgeBase,
+) {
+	if len(kbs) == 0 || userID == "" {
+		return
+	}
+	pins, err := s.repo.ListUserKBPinIDs(ctx, tenantID, userID)
+	if err != nil {
+		// Pin enrichment is best-effort: a transient DB blip here
+		// should not break listing KBs. Log and bail without altering
+		// the slice — caller still gets a valid list, just unsorted by
+		// pin.
+		logger.Warnf(ctx, "applyUserKBPins: failed to load pins for tenant=%d user=%s: %v",
+			tenantID, userID, err)
+		return
+	}
+	if len(pins) == 0 {
+		return
+	}
+	for _, kb := range kbs {
+		if ts, ok := pins[kb.ID]; ok {
+			kb.IsPinned = true
+			t := ts
+			kb.PinnedAt = &t
+		}
+	}
+	sort.SliceStable(kbs, func(i, j int) bool {
+		a, b := kbs[i], kbs[j]
+		if a.IsPinned != b.IsPinned {
+			return a.IsPinned
+		}
+		if a.IsPinned && b.IsPinned {
+			at, bt := a.PinnedAt, b.PinnedAt
+			if at != nil && bt != nil && !at.Equal(*bt) {
+				return at.After(*bt)
+			}
+		}
+		return a.CreatedAt.After(b.CreatedAt)
+	})
 }
 
 // DeleteKnowledgeBase deletes a knowledge base by its ID
@@ -344,9 +667,24 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 	tenantID := types.MustTenantIDFromContext(ctx)
 	tenantInfo, _ := types.TenantInfoFromContext(ctx)
 
+	// Load the KB before soft-delete so we can snapshot its VectorStoreID
+	// into the async cleanup payload. GORM's soft-delete filter hides the
+	// row from subsequent reads, so this read must happen first.
+	kb, err := s.repo.GetKnowledgeBaseByID(ctx, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_base_id": id,
+		})
+		return err
+	}
+	var vectorStoreIDSnapshot *string
+	if kb != nil {
+		vectorStoreIDSnapshot = kb.VectorStoreID
+	}
+
 	// Step 1: Delete the knowledge base record first (mark as deleted)
 	logger.Infof(ctx, "Deleting knowledge base from database")
-	err := s.repo.DeleteKnowledgeBase(ctx, id)
+	err = s.repo.DeleteKnowledgeBase(ctx, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"knowledge_base_id": id,
@@ -355,16 +693,24 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 	}
 
 	// Step 1b: Remove all organization shares for this KB so org settings no longer show them
-	if delErr := s.shareRepo.DeleteByKnowledgeBaseID(ctx, id); delErr != nil {
-		logger.Warnf(ctx, "Failed to delete KB shares for knowledge base %s: %v", id, delErr)
+	if s.shareRepo != nil {
+		if delErr := s.shareRepo.DeleteByKnowledgeBaseID(ctx, id); delErr != nil {
+			logger.Warnf(ctx, "Failed to delete KB shares for knowledge base %s: %v", id, delErr)
+		}
 	}
+
+	// Step 1c: Stop and soft-delete all data sources bound to this KB so cron
+	// schedules and in-flight sync logs do not keep running against a deleted KB.
+	s.deleteDataSourcesForKnowledgeBase(ctx, id)
 
 	// Step 2: Enqueue async task for heavy cleanup operations
 	payload := types.KBDeletePayload{
 		TenantID:         tenantID,
 		KnowledgeBaseID:  id,
 		EffectiveEngines: tenantInfo.GetEffectiveEngines(),
+		VectorStoreID:    vectorStoreIDSnapshot, // snapshot taken before soft-delete
 	}
+	langfuse.InjectTracing(ctx, &payload)
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -373,7 +719,8 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 		return nil
 	}
 
-	task := asynq.NewTask(types.TypeKBDelete, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(3))
+	task := asynq.NewTask(types.TypeKBDelete, payloadBytes,
+		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(3), asynq.Timeout(2*time.Hour))
 	info, err := s.asynqClient.Enqueue(task)
 	if err != nil {
 		logger.Warnf(ctx, "Failed to enqueue KB delete task: %v", err)
@@ -423,12 +770,27 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 		logger.Infof(ctx, "Deleting all knowledge entries and their resources")
 
-		// Delete embeddings from vector store
+		// Delete embeddings from vector store.
+		// Resolve the engine via the factory, using the VectorStoreID captured
+		// at enqueue time (may be nil → falls back to payload.EffectiveEngines).
+		// If the payload references a store no longer owned/registered
+		// (e.g. tampered queue entry or a store that was deleted while the
+		// task sat in the queue), the factory returns a sentinel and we
+		// SkipRetry to avoid burning retries on an unrecoverable situation.
 		logger.Infof(ctx, "Deleting embeddings from vector store")
-		retrieveEngine, err := retriever.NewCompositeRetrieveEngine(
+		retrieveEngine, err := retriever.CreateRetrieveEngineFromPayload(
+			ctx,
 			s.retrieveEngine,
+			s.ownership,
+			payload.TenantID,
 			payload.EffectiveEngines,
+			payload.VectorStoreID,
 		)
+		if errors.Is(err, retriever.ErrVectorStoreForbidden) ||
+			errors.Is(err, retriever.ErrVectorStoreNotFound) {
+			logger.Errorf(ctx, "KB delete task aborted: %v (tenant=%d, kb=%s)", err, payload.TenantID, payload.KnowledgeBaseID)
+			return asynq.SkipRetry
+		}
 		if err != nil {
 			logger.Warnf(ctx, "Failed to create retrieve engine: %v", err)
 		} else {
@@ -455,6 +817,17 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 		}
 
+		// Collect image URLs before chunks are deleted
+		chunkImageInfos, imgErr := s.chunkRepo.ListImageInfoByKnowledgeIDs(ctx, tenantID, knowledgeIDs)
+		if imgErr != nil {
+			logger.Warnf(ctx, "Failed to collect image URLs for KB delete: %v", imgErr)
+		}
+		var imageInfoStrs []string
+		for _, ci := range chunkImageInfos {
+			imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
+		}
+		imageURLs := collectImageURLs(ctx, imageInfoStrs)
+
 		// Delete all chunks
 		logger.Infof(ctx, "Deleting all chunks in knowledge base")
 		for _, knowledgeID := range knowledgeIDs {
@@ -463,8 +836,8 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 		}
 
-		// Delete physical files and adjust storage
-		logger.Infof(ctx, "Deleting physical files")
+		// Delete physical files, extracted images, and adjust storage
+		logger.Infof(ctx, "Deleting physical files and extracted images")
 		storageAdjust := int64(0)
 		for _, knowledge := range knowledgeList {
 			if knowledge.FilePath != "" {
@@ -474,6 +847,7 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 			storageAdjust -= knowledge.StorageSize
 		}
+		deleteExtractedImages(ctx, s.fileSvc, imageURLs)
 		if storageAdjust != 0 {
 			if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantID, storageAdjust); err != nil {
 				logger.Warnf(ctx, "Failed to adjust tenant storage: %v", err)
@@ -507,6 +881,39 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	logger.Infof(ctx, "KB delete task completed successfully, knowledge base ID: %s", kbID)
 	return nil
+}
+
+// deleteDataSourcesForKnowledgeBase mirrors DataSourceService.DeleteDataSource for
+// every data source attached to the KB. Errors on individual sources are logged
+// but do not fail KB deletion — the KB record is already soft-deleted.
+func (s *knowledgeBaseService) deleteDataSourcesForKnowledgeBase(ctx context.Context, kbID string) {
+	if s.dsRepo == nil {
+		return
+	}
+
+	dataSources, err := s.dsRepo.FindByKnowledgeBase(ctx, kbID)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to list data sources for deleted KB %s: %v", kbID, err)
+		return
+	}
+	for _, ds := range dataSources {
+		if ds == nil || ds.ID == "" {
+			continue
+		}
+		if err := s.dsRepo.Delete(ctx, ds.ID); err != nil {
+			logger.Warnf(ctx, "Failed to delete data source %s for KB %s: %v", ds.ID, kbID, err)
+			continue
+		}
+		if s.dsScheduler != nil {
+			s.dsScheduler.Remove(ds.ID)
+		}
+		if s.syncLogRepo != nil {
+			if err := s.syncLogRepo.CancelPendingByDataSource(ctx, ds.ID); err != nil {
+				logger.Warnf(ctx, "Failed to cancel pending sync logs for ds=%s (kb=%s): %v", ds.ID, kbID, err)
+			}
+		}
+		logger.Infof(ctx, "Data source deleted with knowledge base: ds=%s kb=%s", ds.ID, kbID)
+	}
 }
 
 // SetEmbeddingModel sets the embedding model for a knowledge base
@@ -557,6 +964,21 @@ func (s *knowledgeBaseService) SetEmbeddingModel(ctx context.Context, id string,
 
 // CopyKnowledgeBase copies a knowledge base to a new knowledge base (shallow copy).
 // Source and target must belong to the tenant in context; cross-tenant access is rejected.
+//
+// Defensive checks:
+//
+//   - When dstKB != "" (clone into an existing target), the source's
+//     EmbeddingModelID and VectorStoreID must match the target's. Mismatched
+//     embedding models would silently mix incompatible vector spaces;
+//     mismatched vector stores would require copying physical vector data
+//     between stores, which is not yet supported.
+//   - When dstKB == "" (create a new target), VectorStoreID is copied from
+//     the source so the new KB shares the same physical vector index. GORM
+//     `<-:create` allows INSERT, so the new row is well-formed.
+//
+// The handler's CopyKnowledgeBase endpoint runs the same checks synchronously
+// before enqueueing the async clone task, so the 400 errors here are
+// defense-in-depth for the worker entry point.
 func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 	srcKB string, dstKB string,
 ) (*types.KnowledgeBase, *types.KnowledgeBase, error) {
@@ -575,12 +997,47 @@ func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 		if err != nil {
 			return nil, nil, err
 		}
+
+		// Defense 1: embedding model must match. Mixing incompatible
+		// vector spaces would produce semantically broken search results.
+		if sourceKB.EmbeddingModelID != targetKB.EmbeddingModelID {
+			return nil, nil, apperrors.NewBadRequestError(
+				"source and target knowledge bases use different embedding models; " +
+					"clone into a target with the same embedding model")
+		}
+
+		// Defense 2: vector store binding must match. Cross-store cloning
+		// would require copying physical vector data between stores.
+		// (both nil → equal; both same UUID → equal; otherwise → rejected)
+		if !sourceKB.SharesStoreWith(targetKB) {
+			return nil, nil, apperrors.NewBadRequestError(
+				"source and target knowledge bases are bound to different vector stores; " +
+					"cross-store cloning is not yet supported")
+		}
+
+		// Defense 3: the concrete storage instance must match. Comparing only
+		// provider names would incorrectly allow COS-A -> COS-B clones.
+		if tenant, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant); tenant != nil {
+			defaultID, defaultProvider := "", ""
+			if tenant.DefaultStorageBackendID != nil {
+				defaultID = *tenant.DefaultStorageBackendID
+			}
+			if tenant.StorageEngineConfig != nil {
+				defaultProvider = tenant.StorageEngineConfig.DefaultProvider
+			}
+			if !sourceKB.SharesStorageBackendWith(targetKB, defaultID, defaultProvider) {
+				return nil, nil, apperrors.NewBadRequestError(
+					"source and target knowledge bases use different storage instances; cross-storage-backend cloning is not supported")
+			}
+		}
 	} else {
 		var faqConfig *types.FAQConfig
 		if sourceKB.FAQConfig != nil {
 			cfg := *sourceKB.FAQConfig
 			faqConfig = &cfg
 		}
+		// Preserve VectorStoreID so the cloned KB lands on the same
+		// physical index. GORM `<-:create` permits the value at INSERT.
 		targetKB = &types.KnowledgeBase{
 			ID:                    uuid.New().String(),
 			Name:                  sourceKB.Name,
@@ -593,8 +1050,17 @@ func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 			SummaryModelID:        sourceKB.SummaryModelID,
 			VLMConfig:             sourceKB.VLMConfig,
 			StorageProviderConfig: sourceKB.StorageProviderConfig,
+			StorageBackendID:      sourceKB.StorageBackendID,
 			StorageConfig:         sourceKB.StorageConfig,
 			FAQConfig:             faqConfig,
+			VectorStoreID:         sourceKB.VectorStoreID,
+		}
+		// The clone is owned by the caller, not the original creator —
+		// otherwise a Contributor copying someone else's KB would still
+		// not be able to edit the result. Skip synthetic API-key users
+		// (see CreateKnowledgeBase for the same reasoning).
+		if uid, ok := types.UserIDFromContext(ctx); ok && !types.IsSyntheticUserID(uid) {
+			targetKB.CreatorID = uid
 		}
 		targetKB.EnsureDefaults()
 		if err := s.repo.CreateKnowledgeBase(ctx, targetKB); err != nil {
@@ -604,896 +1070,147 @@ func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 	return sourceKB, targetKB, nil
 }
 
-// HybridSearch performs hybrid search, including vector retrieval and keyword retrieval
-func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
-	id string,
-	params types.SearchParams,
-) ([]*types.SearchResult, error) {
-	logger.Infof(ctx, "Hybrid search parameters, knowledge base ID: %s, query text: %s", id, params.QueryText)
-
-	tenantInfo, _ := types.TenantInfoFromContext(ctx)
-	currentTenantID := types.MustTenantIDFromContext(ctx)
-
-	// Create a composite retrieval engine with tenant's configured retrievers
-	retrieveEngine, err := retriever.NewCompositeRetrieveEngine(s.retrieveEngine, tenantInfo.GetEffectiveEngines())
-	if err != nil {
-		logger.Errorf(ctx, "Failed to create retrieval engine: %v", err)
-		return nil, err
+// DuplicateKnowledgeBase creates a new KB from the source KB's settings only.
+// Runtime/content state is deliberately reset so this path never copies
+// knowledge entries, chunks, FAQ content, wiki pages, indexes, shares or pins.
+func (s *knowledgeBaseService) DuplicateKnowledgeBase(
+	ctx context.Context,
+	srcKB string,
+) (*types.KnowledgeBase, error) {
+	srcKB = strings.TrimSpace(srcKB)
+	if srcKB == "" {
+		return nil, apperrors.NewBadRequestError("source knowledge base ID cannot be empty")
 	}
 
-	var retrieveParams []types.RetrieveParams
-	var embeddingModel embedding.Embedder
-	var kb *types.KnowledgeBase
-
-	kb, err = s.repo.GetKnowledgeBaseByID(ctx, id)
+	tenantID := types.MustTenantIDFromContext(ctx)
+	sourceKB, err := s.repo.GetKnowledgeBaseByIDAndTenant(ctx, srcKB, tenantID)
 	if err != nil {
-		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"knowledge_base_id": id,
-		})
+		logger.Errorf(ctx, "Get source knowledge base failed: %v", err)
 		return nil, err
 	}
+	sourceKB.EnsureDefaults()
 
-	// Use 5x over-retrieval to ensure sufficient candidates for RRF fusion and reranking.
-	// Minimum 50 to handle large knowledge bases with diverse content.
-	matchCount := max(params.MatchCount*5, 50)
+	targetKB, err := cloneKnowledgeBaseConfiguration(sourceKB)
+	if err != nil {
+		return nil, err
+	}
+	targetKB.ID = uuid.New().String()
+	targetKB.TenantID = tenantID
+	targetKB.Name = s.buildDuplicateKnowledgeBaseName(ctx, tenantID, sourceKB.Name)
+	targetKB.CreatorID = ""
+	if uid, ok := types.UserIDFromContext(ctx); ok && !types.IsSyntheticUserID(uid) {
+		targetKB.CreatorID = uid
+	}
+	now := time.Now()
+	targetKB.CreatedAt = now
+	targetKB.UpdatedAt = now
+	targetKB.DeletedAt.Valid = false
+	targetKB.DeletedAt.Time = time.Time{}
+	targetKB.IsTemporary = false
+	targetKB.IsPinned = false
+	targetKB.PinnedAt = nil
+	targetKB.KnowledgeCount = 0
+	targetKB.ChunkCount = 0
+	targetKB.IsProcessing = false
+	targetKB.ProcessingCount = 0
+	targetKB.ShareCount = 0
+	targetKB.CreatorName = ""
+	targetKB.EnsureDefaults()
+	targetKB.Normalize()
 
-	// Add vector retrieval params if supported
-	if retrieveEngine.SupportRetriever(types.VectorRetrieverType) && !params.DisableVectorMatch {
-		logger.Info(ctx, "Vector retrieval supported, preparing vector retrieval parameters")
-
-		logger.Infof(ctx, "Getting embedding model, model ID: %s", kb.EmbeddingModelID)
-
-		// Check if this is a cross-tenant shared knowledge base
-		// For shared KB, we must use the source tenant's embedding model to ensure vector compatibility
-		if kb.TenantID != currentTenantID {
-			logger.Infof(ctx, "Cross-tenant knowledge base detected, using source tenant's embedding model. KB tenant: %d, current tenant: %d", kb.TenantID, currentTenantID)
-			embeddingModel, err = s.modelService.GetEmbeddingModelForTenant(ctx, kb.EmbeddingModelID, kb.TenantID)
-		} else {
-			embeddingModel, err = s.modelService.GetEmbeddingModel(ctx, kb.EmbeddingModelID)
-		}
-
-		if err != nil {
-			logger.Errorf(ctx, "Failed to get embedding model, model ID: %s, error: %v", kb.EmbeddingModelID, err)
+	if targetKB.HasVectorStore() {
+		if err := s.validateVectorStoreBinding(ctx, tenantID, *targetKB.VectorStoreID); err != nil {
 			return nil, err
 		}
-		logger.Infof(ctx, "Embedding model retrieved: %v", embeddingModel)
-
-		// Generate embedding vector for the query text
-		logger.Info(ctx, "Starting to generate query embedding")
-		queryEmbedding, err := embeddingModel.Embed(ctx, params.QueryText)
-		if err != nil {
-			logger.Errorf(ctx, "Failed to embed query text, query text: %s, error: %v", params.QueryText, err)
-			return nil, err
-		}
-		logger.Infof(ctx, "Query embedding generated successfully, embedding vector length: %d", len(queryEmbedding))
-
-		vectorParams := types.RetrieveParams{
-			Query:            params.QueryText,
-			Embedding:        queryEmbedding,
-			KnowledgeBaseIDs: []string{id},
-			TopK:             matchCount,
-			Threshold:        params.VectorThreshold,
-			RetrieverType:    types.VectorRetrieverType,
-			KnowledgeIDs:     params.KnowledgeIDs,
-			TagIDs:           params.TagIDs,
-		}
-
-		// For FAQ knowledge base, use FAQ index
-		if kb.Type == types.KnowledgeBaseTypeFAQ {
-			vectorParams.KnowledgeType = types.KnowledgeTypeFAQ
-		}
-
-		retrieveParams = append(retrieveParams, vectorParams)
-		logger.Info(ctx, "Vector retrieval parameters setup completed")
 	}
 
-	// Add keyword retrieval params if supported and not FAQ
-	if retrieveEngine.SupportRetriever(types.KeywordsRetrieverType) && !params.DisableKeywordsMatch &&
-		kb.Type != types.KnowledgeBaseTypeFAQ {
-		logger.Info(ctx, "Keyword retrieval supported, preparing keyword retrieval parameters")
-		retrieveParams = append(retrieveParams, types.RetrieveParams{
-			Query:            params.QueryText,
-			KnowledgeBaseIDs: []string{id},
-			TopK:             matchCount,
-			Threshold:        params.KeywordThreshold,
-			RetrieverType:    types.KeywordsRetrieverType,
-			KnowledgeIDs:     params.KnowledgeIDs,
-			TagIDs:           params.TagIDs,
-		})
-		logger.Info(ctx, "Keyword retrieval parameters setup completed")
-	}
-
-	if len(retrieveParams) == 0 {
-		logger.Error(ctx, "No retrieval parameters available")
-		return nil, errors.New("no retrieve params")
-	}
-
-	// Execute retrieval using the configured engines
-	logger.Infof(ctx, "Starting retrieval, parameter count: %d", len(retrieveParams))
-	retrieveResults, err := retrieveEngine.Retrieve(ctx, retrieveParams)
-	if err != nil {
-		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"knowledge_base_id": id,
-			"query_text":        params.QueryText,
-		})
+	if err := s.repo.CreateKnowledgeBase(ctx, targetKB); err != nil {
 		return nil, err
 	}
-
-	// Collect all results from different retrievers and deduplicate by chunk ID
-	logger.Infof(ctx, "Processing retrieval results")
-
-	// Separate results by retriever type for RRF fusion
-	var vectorResults []*types.IndexWithScore
-	var keywordResults []*types.IndexWithScore
-	for _, retrieveResult := range retrieveResults {
-		logger.Infof(ctx, "Retrieval results, engine: %v, retriever: %v, count: %v",
-			retrieveResult.RetrieverEngineType,
-			retrieveResult.RetrieverType,
-			len(retrieveResult.Results),
-		)
-		if retrieveResult.RetrieverType == types.VectorRetrieverType {
-			vectorResults = append(vectorResults, retrieveResult.Results...)
-		} else {
-			keywordResults = append(keywordResults, retrieveResult.Results...)
-		}
-	}
-
-	// Early return if no results
-	if len(vectorResults) == 0 && len(keywordResults) == 0 {
-		logger.Info(ctx, "No search results found")
-		return nil, nil
-	}
-	logger.Infof(ctx, "Result count before fusion: vector=%d, keyword=%d", len(vectorResults), len(keywordResults))
-
-	var deduplicatedChunks []*types.IndexWithScore
-
-	// If only vector results (no keyword results), keep original embedding scores
-	// This is important for FAQ search which only uses vector retrieval
-	if len(keywordResults) == 0 {
-		logger.Info(ctx, "Only vector results, keeping original embedding scores")
-		chunkInfoMap := make(map[string]*types.IndexWithScore)
-		for _, r := range vectorResults {
-			// Keep the highest score for each chunk (FAQ may have multiple similar questions)
-			if existing, exists := chunkInfoMap[r.ChunkID]; !exists || r.Score > existing.Score {
-				chunkInfoMap[r.ChunkID] = r
-			}
-		}
-		deduplicatedChunks = make([]*types.IndexWithScore, 0, len(chunkInfoMap))
-		for _, info := range chunkInfoMap {
-			deduplicatedChunks = append(deduplicatedChunks, info)
-		}
-		slices.SortFunc(deduplicatedChunks, func(a, b *types.IndexWithScore) int {
-			if a.Score > b.Score {
-				return -1
-			} else if a.Score < b.Score {
-				return 1
-			}
-			return 0
-		})
-		logger.Infof(ctx, "Result count after deduplication: %d", len(deduplicatedChunks))
-	} else {
-		// Use RRF (Reciprocal Rank Fusion) to merge results from multiple retrievers
-		// RRF score = sum(1 / (k + rank)) for each retriever where the chunk appears
-		// k=60 is a common choice that works well in practice
-		const rrfK = 60
-
-		// Build rank maps for each retriever (already sorted by score from retriever)
-		vectorRanks := make(map[string]int)
-		for i, r := range vectorResults {
-			if _, exists := vectorRanks[r.ChunkID]; !exists {
-				vectorRanks[r.ChunkID] = i + 1 // 1-indexed rank
-			}
-		}
-		keywordRanks := make(map[string]int)
-		for i, r := range keywordResults {
-			if _, exists := keywordRanks[r.ChunkID]; !exists {
-				keywordRanks[r.ChunkID] = i + 1 // 1-indexed rank
-			}
-		}
-
-		// Collect all unique chunks and compute RRF scores
-		// Keep the highest score for each chunk from each retriever
-		chunkInfoMap := make(map[string]*types.IndexWithScore)
-		rrfScores := make(map[string]float64)
-
-		// Process vector results - keep highest score per chunk
-		for _, r := range vectorResults {
-			if existing, exists := chunkInfoMap[r.ChunkID]; !exists || r.Score > existing.Score {
-				chunkInfoMap[r.ChunkID] = r
-			}
-		}
-		// Process keyword results - only add if not already from vector
-		for _, r := range keywordResults {
-			if _, exists := chunkInfoMap[r.ChunkID]; !exists {
-				chunkInfoMap[r.ChunkID] = r
-			}
-		}
-
-		// Compute weighted RRF scores (vector retrieval weighted higher for semantic relevance)
-		const vectorWeight = 0.7
-		const keywordWeight = 0.3
-		for chunkID := range chunkInfoMap {
-			rrfScore := 0.0
-			if rank, ok := vectorRanks[chunkID]; ok {
-				rrfScore += vectorWeight / float64(rrfK+rank)
-			}
-			if rank, ok := keywordRanks[chunkID]; ok {
-				rrfScore += keywordWeight / float64(rrfK+rank)
-			}
-			rrfScores[chunkID] = rrfScore
-		}
-
-		// Convert to slice and sort by RRF score
-		deduplicatedChunks = make([]*types.IndexWithScore, 0, len(chunkInfoMap))
-		for chunkID, info := range chunkInfoMap {
-			// Store RRF score in the Score field for downstream processing
-			info.Score = rrfScores[chunkID]
-			deduplicatedChunks = append(deduplicatedChunks, info)
-		}
-		slices.SortFunc(deduplicatedChunks, func(a, b *types.IndexWithScore) int {
-			if a.Score > b.Score {
-				return -1
-			} else if a.Score < b.Score {
-				return 1
-			}
-			return 0
-		})
-
-		logger.Infof(ctx, "Result count after RRF fusion: %d", len(deduplicatedChunks))
-
-		// Log top results after RRF fusion for debugging
-		for i, chunk := range deduplicatedChunks {
-			if i < 15 {
-				vRank, vOk := vectorRanks[chunk.ChunkID]
-				kRank, kOk := keywordRanks[chunk.ChunkID]
-				logger.Debugf(ctx, "RRF rank %d: chunk_id=%s, rrf_score=%.6f, vector_rank=%v(%v), keyword_rank=%v(%v)",
-					i, chunk.ChunkID, chunk.Score, vRank, vOk, kRank, kOk)
-			}
-		}
-	}
-
-	kb.EnsureDefaults()
-
-	// Check if we need iterative retrieval for FAQ with separate indexing
-	// Only use iterative retrieval if we don't have enough unique chunks after first deduplication
-	needsIterativeRetrieval := len(deduplicatedChunks) < params.MatchCount &&
-		kb.Type == types.KnowledgeBaseTypeFAQ && len(vectorResults) == matchCount
-	if needsIterativeRetrieval {
-		logger.Info(ctx, "Not enough unique chunks, using iterative retrieval for FAQ")
-		// Use iterative retrieval to get more unique chunks (with negative question filtering inside)
-		deduplicatedChunks = s.iterativeRetrieveWithDeduplication(
-			ctx,
-			retrieveEngine,
-			retrieveParams,
-			params.MatchCount,
-			params.QueryText,
-		)
-	} else if kb.Type == types.KnowledgeBaseTypeFAQ {
-		// Filter by negative questions if not using iterative retrieval
-		deduplicatedChunks = s.filterByNegativeQuestions(ctx, deduplicatedChunks, params.QueryText)
-		logger.Infof(ctx, "Result count after negative question filtering: %d", len(deduplicatedChunks))
-	}
-
-	// Limit to MatchCount
-	if len(deduplicatedChunks) > params.MatchCount {
-		deduplicatedChunks = deduplicatedChunks[:params.MatchCount]
-	}
-
-	return s.processSearchResults(ctx, deduplicatedChunks, params.SkipContextEnrichment)
+	return targetKB, nil
 }
 
-// iterativeRetrieveWithDeduplication performs iterative retrieval until enough unique chunks are found
-// This is used for FAQ knowledge bases with separate indexing mode
-// Negative question filtering is applied after each iteration with chunk data caching
-func (s *knowledgeBaseService) iterativeRetrieveWithDeduplication(ctx context.Context,
-	retrieveEngine *retriever.CompositeRetrieveEngine,
-	retrieveParams []types.RetrieveParams,
-	matchCount int,
-	queryText string,
-) []*types.IndexWithScore {
-	maxIterations := 5
-	// Start with a larger TopK since we're called when first retrieval wasn't enough
-	// The first retrieval already used matchCount*3, so start from there
-	currentTopK := matchCount * 3
-	uniqueChunks := make(map[string]*types.IndexWithScore)
-	// Cache chunk data to avoid repeated DB queries across iterations
-	chunkDataCache := make(map[string]*types.Chunk)
-	// Track chunks that have been filtered out by negative questions
-	filteredOutChunks := make(map[string]struct{})
-
-	queryTextLower := strings.ToLower(strings.TrimSpace(queryText))
-	tenantID := types.MustTenantIDFromContext(ctx)
-
-	for i := 0; i < maxIterations; i++ {
-		// Update TopK in retrieve params
-		updatedParams := make([]types.RetrieveParams, len(retrieveParams))
-		for j := range retrieveParams {
-			updatedParams[j] = retrieveParams[j]
-			updatedParams[j].TopK = currentTopK
-		}
-
-		// Execute retrieval
-		retrieveResults, err := retrieveEngine.Retrieve(ctx, updatedParams)
-		if err != nil {
-			logger.Warnf(ctx, "Iterative retrieval failed at iteration %d: %v", i+1, err)
-			break
-		}
-
-		// Collect results
-		iterationResults := []*types.IndexWithScore{}
-		for _, retrieveResult := range retrieveResults {
-			iterationResults = append(iterationResults, retrieveResult.Results...)
-		}
-
-		if len(iterationResults) == 0 {
-			logger.Infof(ctx, "No results found at iteration %d", i+1)
-			break
-		}
-
-		totalRetrieved := len(iterationResults)
-
-		// Collect new chunk IDs that need to be fetched from DB
-		newChunkIDs := make([]string, 0)
-		for _, result := range iterationResults {
-			if _, cached := chunkDataCache[result.ChunkID]; !cached {
-				if _, filtered := filteredOutChunks[result.ChunkID]; !filtered {
-					newChunkIDs = append(newChunkIDs, result.ChunkID)
-				}
-			}
-		}
-
-		// Batch fetch only new chunks
-		if len(newChunkIDs) > 0 {
-			newChunks, err := s.chunkRepo.ListChunksByID(ctx, tenantID, newChunkIDs)
-			if err != nil {
-				logger.Warnf(ctx, "Failed to fetch chunks at iteration %d: %v", i+1, err)
-			} else {
-				for _, chunk := range newChunks {
-					chunkDataCache[chunk.ID] = chunk
-				}
-			}
-		}
-
-		// Deduplicate, merge, and filter in one pass
-		for _, result := range iterationResults {
-			// Skip if already filtered out
-			if _, filtered := filteredOutChunks[result.ChunkID]; filtered {
-				continue
-			}
-
-			// Check negative questions using cached data
-			if chunkData, ok := chunkDataCache[result.ChunkID]; ok {
-				if chunkData.ChunkType == types.ChunkTypeFAQ {
-					if meta, err := chunkData.FAQMetadata(); err == nil && meta != nil {
-						if s.matchesNegativeQuestions(queryTextLower, meta.NegativeQuestions) {
-							filteredOutChunks[result.ChunkID] = struct{}{}
-							delete(uniqueChunks, result.ChunkID)
-							continue
-						}
-					}
-				}
-			}
-
-			// Keep highest score for each chunk
-			if existing, ok := uniqueChunks[result.ChunkID]; !ok || result.Score > existing.Score {
-				uniqueChunks[result.ChunkID] = result
-			}
-		}
-
-		logger.Infof(
-			ctx,
-			"After iteration %d: retrieved %d results, found %d valid unique chunks (target: %d)",
-			i+1,
-			totalRetrieved,
-			len(uniqueChunks),
-			matchCount,
-		)
-
-		// Early stop: Check if we have enough unique chunks after deduplication and filtering
-		if len(uniqueChunks) >= matchCount {
-			logger.Infof(ctx, "Found enough unique chunks after %d iterations", i+1)
-			break
-		}
-
-		// Early stop: If we got fewer results than TopK, there are no more results to retrieve
-		if totalRetrieved < currentTopK {
-			logger.Infof(ctx, "No more results available (got %d < %d), stopping iteration", totalRetrieved, currentTopK)
-			break
-		}
-
-		// Increase TopK for next iteration
-		currentTopK *= 2
-	}
-
-	// Convert map to slice and sort by score
-	result := make([]*types.IndexWithScore, 0, len(uniqueChunks))
-	for _, chunk := range uniqueChunks {
-		result = append(result, chunk)
-	}
-
-	// Sort by score descending
-	slices.SortFunc(result, func(a, b *types.IndexWithScore) int {
-		if a.Score > b.Score {
-			return -1
-		} else if a.Score < b.Score {
-			return 1
-		}
-		return 0
-	})
-
-	logger.Infof(ctx, "Iterative retrieval completed: %d unique chunks found after filtering", len(result))
-	return result
-}
-
-// filterByNegativeQuestions filters out chunks that match negative questions for FAQ knowledge bases.
-func (s *knowledgeBaseService) filterByNegativeQuestions(ctx context.Context,
-	chunks []*types.IndexWithScore,
-	queryText string,
-) []*types.IndexWithScore {
-	if len(chunks) == 0 {
-		return chunks
-	}
-
-	queryTextLower := strings.ToLower(strings.TrimSpace(queryText))
-	if queryTextLower == "" {
-		return chunks
-	}
-
-	tenantID := types.MustTenantIDFromContext(ctx)
-
-	// Collect chunk IDs
-	chunkIDs := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
-		chunkIDs = append(chunkIDs, chunk.ChunkID)
-	}
-
-	// Batch fetch chunks to get negative questions
-	allChunks, err := s.chunkRepo.ListChunksByID(ctx, tenantID, chunkIDs)
-	if err != nil {
-		logger.Warnf(ctx, "Failed to fetch chunks for negative question filtering: %v", err)
-		// If we can't fetch chunks, return original results
-		return chunks
-	}
-
-	// Build chunk map for quick lookup
-	chunkMap := make(map[string]*types.Chunk, len(allChunks))
-	for _, chunk := range allChunks {
-		chunkMap[chunk.ID] = chunk
-	}
-
-	// Filter out chunks that match negative questions
-	filteredChunks := make([]*types.IndexWithScore, 0, len(chunks))
-	for _, chunk := range chunks {
-		chunkData, ok := chunkMap[chunk.ChunkID]
-		if !ok {
-			// If chunk not found, keep it (shouldn't happen, but be safe)
-			filteredChunks = append(filteredChunks, chunk)
-			continue
-		}
-
-		// Only filter FAQ type chunks
-		if chunkData.ChunkType != types.ChunkTypeFAQ {
-			filteredChunks = append(filteredChunks, chunk)
-			continue
-		}
-
-		// Get FAQ metadata and check negative questions
-		meta, err := chunkData.FAQMetadata()
-		if err != nil || meta == nil {
-			// If we can't parse metadata, keep the chunk
-			filteredChunks = append(filteredChunks, chunk)
-			continue
-		}
-
-		// Check if query matches any negative question
-		if s.matchesNegativeQuestions(queryTextLower, meta.NegativeQuestions) {
-			logger.Debugf(ctx, "Filtered FAQ chunk %s due to negative question match", chunk.ChunkID)
-			continue
-		}
-
-		// Keep the chunk
-		filteredChunks = append(filteredChunks, chunk)
-	}
-
-	return filteredChunks
-}
-
-// matchesNegativeQuestions checks if the query text matches any negative questions.
-// Returns true if the query matches any negative question, false otherwise.
-func (s *knowledgeBaseService) matchesNegativeQuestions(queryTextLower string, negativeQuestions []string) bool {
-	if len(negativeQuestions) == 0 {
-		return false
-	}
-
-	for _, negativeQ := range negativeQuestions {
-		negativeQLower := strings.ToLower(strings.TrimSpace(negativeQ))
-		if negativeQLower == "" {
-			continue
-		}
-		// Check if query text is exactly the same as the negative question
-		if queryTextLower == negativeQLower {
-			return true
-		}
-	}
-	return false
-}
-
-// processSearchResults handles the processing of search results, optimizing database queries
-func (s *knowledgeBaseService) processSearchResults(ctx context.Context,
-	chunks []*types.IndexWithScore,
-	skipEnrichment bool,
-) ([]*types.SearchResult, error) {
-	if len(chunks) == 0 {
-		return nil, nil
-	}
-
-	tenantID := types.MustTenantIDFromContext(ctx)
-
-	// Prepare data structures for efficient processing
-	var knowledgeIDs []string
-	var chunkIDs []string
-	chunkScores := make(map[string]float64)
-	chunkMatchTypes := make(map[string]types.MatchType)
-	chunkMatchedContents := make(map[string]string)
-	processedKnowledgeIDs := make(map[string]bool)
-
-	// Collect all knowledge and chunk IDs
-	for _, chunk := range chunks {
-		if !processedKnowledgeIDs[chunk.KnowledgeID] {
-			knowledgeIDs = append(knowledgeIDs, chunk.KnowledgeID)
-			processedKnowledgeIDs[chunk.KnowledgeID] = true
-		}
-
-		chunkIDs = append(chunkIDs, chunk.ChunkID)
-		chunkScores[chunk.ChunkID] = chunk.Score
-		chunkMatchTypes[chunk.ChunkID] = chunk.MatchType
-		chunkMatchedContents[chunk.ChunkID] = chunk.Content
-	}
-
-	// Batch fetch knowledge data (include shared KB so cross-tenant retrieval works)
-	logger.Infof(ctx, "Fetching knowledge data for %d IDs", len(knowledgeIDs))
-	knowledgeMap, err := s.fetchKnowledgeDataWithShared(ctx, tenantID, knowledgeIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	// Batch fetch chunks (include shared KB chunks: first by tenant, then by ID-only for missing with permission check)
-	logger.Infof(ctx, "Fetching chunk data for %d IDs", len(chunkIDs))
-	allChunks, err := s.listChunksByIDWithShared(ctx, tenantID, chunkIDs)
-	if err != nil {
-		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"tenant_id": tenantID,
-			"chunk_ids": chunkIDs,
-		})
-		return nil, err
-	}
-	logger.Infof(ctx, "Chunk data fetched successfully, count: %d", len(allChunks))
-
-	// Build chunk map and collect additional IDs to fetch
-	chunkMap := make(map[string]*types.Chunk, len(allChunks))
-	var additionalChunkIDs []string
-	processedChunkIDs := make(map[string]bool)
-
-	// First pass: Build chunk map and collect parent IDs
-	for _, chunk := range allChunks {
-		chunkMap[chunk.ID] = chunk
-		processedChunkIDs[chunk.ID] = true
-
-		if !skipEnrichment {
-			// Collect parent chunks
-			if chunk.ParentChunkID != "" && !processedChunkIDs[chunk.ParentChunkID] {
-				additionalChunkIDs = append(additionalChunkIDs, chunk.ParentChunkID)
-				processedChunkIDs[chunk.ParentChunkID] = true
-
-				// Pass score to parent
-				chunkScores[chunk.ParentChunkID] = chunkScores[chunk.ID]
-				chunkMatchTypes[chunk.ParentChunkID] = types.MatchTypeParentChunk
-			}
-
-			// Collect related chunks
-			relationChunkIDs := s.collectRelatedChunkIDs(chunk, processedChunkIDs)
-			for _, chunkID := range relationChunkIDs {
-				additionalChunkIDs = append(additionalChunkIDs, chunkID)
-				chunkMatchTypes[chunkID] = types.MatchTypeRelationChunk
-			}
-
-			// Add nearby chunks (prev and next)
-			if slices.Contains([]string{types.ChunkTypeText}, chunk.ChunkType) {
-				if chunk.NextChunkID != "" && !processedChunkIDs[chunk.NextChunkID] {
-					additionalChunkIDs = append(additionalChunkIDs, chunk.NextChunkID)
-					processedChunkIDs[chunk.NextChunkID] = true
-					chunkMatchTypes[chunk.NextChunkID] = types.MatchTypeNearByChunk
-				}
-				if chunk.PreChunkID != "" && !processedChunkIDs[chunk.PreChunkID] {
-					additionalChunkIDs = append(additionalChunkIDs, chunk.PreChunkID)
-					processedChunkIDs[chunk.PreChunkID] = true
-					chunkMatchTypes[chunk.PreChunkID] = types.MatchTypeNearByChunk
-				}
-			}
-		}
-	}
-
-	// Fetch all additional chunks in one go if needed (include shared KB)
-	if len(additionalChunkIDs) > 0 {
-		logger.Infof(ctx, "Fetching %d additional chunks", len(additionalChunkIDs))
-		additionalChunks, err := s.listChunksByIDWithShared(ctx, tenantID, additionalChunkIDs)
-		if err != nil {
-			logger.Warnf(ctx, "Failed to fetch some additional chunks: %v", err)
-			// Continue with what we have
-		} else {
-			// Add to chunk map
-			for _, chunk := range additionalChunks {
-				chunkMap[chunk.ID] = chunk
-			}
-		}
-	}
-
-	// Build final search results - preserve original order from input chunks
-	var searchResults []*types.SearchResult
-	addedChunkIDs := make(map[string]bool)
-
-	// First pass: Add results in the original order from input chunks
-	for _, inputChunk := range chunks {
-		chunk, exists := chunkMap[inputChunk.ChunkID]
-		if !exists {
-			logger.Debugf(ctx, "Chunk not found in chunkMap: %s", inputChunk.ChunkID)
-			continue
-		}
-		if !s.isValidTextChunk(chunk) {
-			logger.Debugf(ctx, "Chunk is not valid text chunk: %s, type: %s", chunk.ID, chunk.ChunkType)
-			continue
-		}
-		if addedChunkIDs[chunk.ID] {
-			continue
-		}
-
-		score := chunkScores[chunk.ID]
-		if knowledge, ok := knowledgeMap[chunk.KnowledgeID]; ok {
-			matchType := chunkMatchTypes[chunk.ID]
-			matchedContent := chunkMatchedContents[chunk.ID]
-			searchResults = append(searchResults, s.buildSearchResult(chunk, knowledge, score, matchType, matchedContent))
-			addedChunkIDs[chunk.ID] = true
-		} else {
-			logger.Warnf(ctx, "Knowledge not found for chunk: %s, knowledge_id: %s", chunk.ID, chunk.KnowledgeID)
-		}
-	}
-
-	// Second pass: Add additional chunks (parent, nearby, relation) that weren't in original input
-	if !skipEnrichment {
-		for chunkID, chunk := range chunkMap {
-			if addedChunkIDs[chunkID] || !s.isValidTextChunk(chunk) {
-				continue
-			}
-
-			score, hasScore := chunkScores[chunkID]
-			if !hasScore || score <= 0 {
-				score = 0.0
-			}
-
-			if knowledge, ok := knowledgeMap[chunk.KnowledgeID]; ok {
-				matchType := types.MatchTypeParentChunk
-				if specificType, exists := chunkMatchTypes[chunkID]; exists {
-					matchType = specificType
-				} else {
-					logger.Warnf(ctx, "Unkonwn match type for chunk: %s", chunkID)
-					continue
-				}
-				matchedContent := chunkMatchedContents[chunkID]
-				searchResults = append(searchResults, s.buildSearchResult(chunk, knowledge, score, matchType, matchedContent))
-			}
-		}
-	}
-	logger.Infof(ctx, "Search results processed, total: %d", len(searchResults))
-	return searchResults, nil
-}
-
-// collectRelatedChunkIDs extracts related chunk IDs from a chunk
-func (s *knowledgeBaseService) collectRelatedChunkIDs(chunk *types.Chunk, processedIDs map[string]bool) []string {
-	var relatedIDs []string
-	// Process direct relations
-	if len(chunk.RelationChunks) > 0 {
-		var relations []string
-		if err := json.Unmarshal(chunk.RelationChunks, &relations); err == nil {
-			for _, id := range relations {
-				if !processedIDs[id] {
-					relatedIDs = append(relatedIDs, id)
-					processedIDs[id] = true
-				}
-			}
-		}
-	}
-	return relatedIDs
-}
-
-// buildSearchResult creates a search result from chunk and knowledge
-func (s *knowledgeBaseService) buildSearchResult(chunk *types.Chunk,
-	knowledge *types.Knowledge,
-	score float64,
-	matchType types.MatchType,
-	matchedContent string,
-) *types.SearchResult {
-	return &types.SearchResult{
-		ID:                chunk.ID,
-		Content:           chunk.Content,
-		KnowledgeID:       chunk.KnowledgeID,
-		ChunkIndex:        chunk.ChunkIndex,
-		KnowledgeTitle:    knowledge.Title,
-		StartAt:           chunk.StartAt,
-		EndAt:             chunk.EndAt,
-		Seq:               chunk.ChunkIndex,
-		Score:             score,
-		MatchType:         matchType,
-		Metadata:          knowledge.GetMetadata(),
-		ChunkType:         string(chunk.ChunkType),
-		ParentChunkID:     chunk.ParentChunkID,
-		ImageInfo:         chunk.ImageInfo,
-		KnowledgeFilename: knowledge.FileName,
-		KnowledgeSource:   knowledge.Source,
-		ChunkMetadata:     chunk.Metadata,
-		MatchedContent:    matchedContent,
+func duplicateKBCopySuffix(locale string) string {
+	locale = strings.ToLower(locale)
+	switch {
+	case strings.HasPrefix(locale, "zh"):
+		return " 副本"
+	case strings.HasPrefix(locale, "ko"):
+		return " 사본"
+	case strings.HasPrefix(locale, "ru"):
+		return " копия"
+	default:
+		return " Copy"
 	}
 }
 
-// isValidTextChunk checks if a chunk is a valid text chunk
-func (s *knowledgeBaseService) isValidTextChunk(chunk *types.Chunk) bool {
-	return slices.Contains([]types.ChunkType{
-		types.ChunkTypeText, types.ChunkTypeSummary,
-		types.ChunkTypeTableColumn, types.ChunkTypeTableSummary,
-		types.ChunkTypeFAQ,
-	}, chunk.ChunkType)
+func duplicateKBDefaultName(locale string) string {
+	locale = strings.ToLower(locale)
+	switch {
+	case strings.HasPrefix(locale, "zh"):
+		return "知识库"
+	case strings.HasPrefix(locale, "ko"):
+		return "지식베이스"
+	case strings.HasPrefix(locale, "ru"):
+		return "База знаний"
+	default:
+		return "Knowledge Base"
+	}
 }
 
-// fetchKnowledgeData gets knowledge data in batch
-func (s *knowledgeBaseService) fetchKnowledgeData(ctx context.Context,
+func (s *knowledgeBaseService) buildDuplicateKnowledgeBaseName(
+	ctx context.Context,
 	tenantID uint64,
-	knowledgeIDs []string,
-) (map[string]*types.Knowledge, error) {
-	knowledges, err := s.kgRepo.GetKnowledgeBatch(ctx, tenantID, knowledgeIDs)
+	sourceName string,
+) string {
+	locale, ok := types.LanguageFromContext(ctx)
+	if !ok {
+		locale = types.DefaultLanguage()
+	}
+	suffix := duplicateKBCopySuffix(locale)
+
+	baseName := strings.TrimSpace(sourceName)
+	if baseName == "" {
+		baseName = duplicateKBDefaultName(locale)
+	}
+
+	kbs, err := s.repo.ListKnowledgeBasesByTenantID(ctx, tenantID)
 	if err != nil {
-		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"tenant_id":     tenantID,
-			"knowledge_ids": knowledgeIDs,
-		})
-		return nil, err
+		logger.Warnf(ctx, "List tenant knowledge bases failed while building duplicate name: %v", err)
+		return baseName + suffix
 	}
 
-	knowledgeMap := make(map[string]*types.Knowledge, len(knowledges))
-	for _, knowledge := range knowledges {
-		knowledgeMap[knowledge.ID] = knowledge
+	existing := make(map[string]struct{}, len(kbs))
+	for _, kb := range kbs {
+		if kb == nil {
+			continue
+		}
+		existing[kb.Name] = struct{}{}
 	}
 
-	return knowledgeMap, nil
+	candidate := baseName + suffix
+	if _, ok := existing[candidate]; !ok {
+		return candidate
+	}
+	for i := 2; ; i++ {
+		candidate = fmt.Sprintf("%s%s %d", baseName, suffix, i)
+		if _, ok := existing[candidate]; !ok {
+			return candidate
+		}
+	}
 }
 
-// fetchKnowledgeDataWithShared gets knowledge data in batch, including knowledge from shared KBs the user has access to.
-func (s *knowledgeBaseService) fetchKnowledgeDataWithShared(ctx context.Context,
-	tenantID uint64,
-	knowledgeIDs []string,
-) (map[string]*types.Knowledge, error) {
-	knowledges, err := s.kgRepo.GetKnowledgeBatch(ctx, tenantID, knowledgeIDs)
-	if err != nil {
-		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"tenant_id":     tenantID,
-			"knowledge_ids": knowledgeIDs,
-		})
-		return nil, err
+func cloneKnowledgeBaseConfiguration(sourceKB *types.KnowledgeBase) (*types.KnowledgeBase, error) {
+	if sourceKB == nil {
+		return nil, apperrors.NewBadRequestError("source knowledge base cannot be empty")
 	}
-
-	knowledgeMap := make(map[string]*types.Knowledge, len(knowledges))
-	for _, k := range knowledges {
-		knowledgeMap[k.ID] = k
-	}
-
-	// Count how many IDs are missing (not found in current tenant)
-	var missingIDs []string
-	for _, id := range knowledgeIDs {
-		if knowledgeMap[id] == nil {
-			missingIDs = append(missingIDs, id)
-		}
-	}
-	if len(missingIDs) == 0 {
-		return knowledgeMap, nil
-	}
-	logger.Infof(ctx, "[fetchKnowledgeDataWithShared] %d knowledge IDs not found in current tenant, attempting shared KB lookup", len(missingIDs))
-
-	userIDVal := ctx.Value(types.UserIDContextKey)
-	if userIDVal == nil {
-		logger.Warnf(ctx, "[fetchKnowledgeDataWithShared] userID not found in context, skipping shared KB lookup")
-		return knowledgeMap, nil
-	}
-	userID, ok := userIDVal.(string)
-	if !ok || userID == "" {
-		logger.Warnf(ctx, "[fetchKnowledgeDataWithShared] userID is empty, skipping shared KB lookup")
-		return knowledgeMap, nil
-	}
-
-	logger.Infof(ctx, "[fetchKnowledgeDataWithShared] Looking up %d missing knowledge IDs with userID=%s", len(missingIDs), userID)
-	for _, id := range missingIDs {
-		k, err := s.kgRepo.GetKnowledgeByIDOnly(ctx, id)
-		if err != nil || k == nil || k.KnowledgeBaseID == "" {
-			logger.Debugf(ctx, "[fetchKnowledgeDataWithShared] Knowledge %s not found or has no KB", id)
-			continue
-		}
-		hasPermission, err := s.kbShareService.HasKBPermission(ctx, k.KnowledgeBaseID, userID, types.OrgRoleViewer)
-		if err != nil {
-			logger.Debugf(ctx, "[fetchKnowledgeDataWithShared] Permission check error for KB %s: %v", k.KnowledgeBaseID, err)
-			continue
-		}
-		if !hasPermission {
-			logger.Debugf(ctx, "[fetchKnowledgeDataWithShared] No permission for KB %s", k.KnowledgeBaseID)
-			continue
-		}
-		logger.Debugf(ctx, "[fetchKnowledgeDataWithShared] Found shared knowledge %s in KB %s", id, k.KnowledgeBaseID)
-		knowledgeMap[k.ID] = k
-	}
-
-	logger.Infof(ctx, "[fetchKnowledgeDataWithShared] After shared lookup, total knowledge found: %d", len(knowledgeMap))
-	return knowledgeMap, nil
-}
-
-// listChunksByIDWithShared fetches chunks by IDs, including chunks from shared KBs the user has access to.
-func (s *knowledgeBaseService) listChunksByIDWithShared(ctx context.Context,
-	tenantID uint64,
-	chunkIDs []string,
-) ([]*types.Chunk, error) {
-	chunks, err := s.chunkRepo.ListChunksByID(ctx, tenantID, chunkIDs)
+	data, err := json.Marshal(sourceKB)
 	if err != nil {
 		return nil, err
 	}
-
-	foundSet := make(map[string]bool)
-	for _, c := range chunks {
-		if c != nil {
-			foundSet[c.ID] = true
-		}
+	var targetKB types.KnowledgeBase
+	if err := json.Unmarshal(data, &targetKB); err != nil {
+		return nil, err
 	}
-
-	var missing []string
-	for _, id := range chunkIDs {
-		if !foundSet[id] {
-			missing = append(missing, id)
-		}
-	}
-	if len(missing) == 0 {
-		return chunks, nil
-	}
-	logger.Infof(ctx, "[listChunksByIDWithShared] %d chunks not found in current tenant, attempting shared KB lookup", len(missing))
-
-	userIDVal := ctx.Value(types.UserIDContextKey)
-	if userIDVal == nil {
-		logger.Warnf(ctx, "[listChunksByIDWithShared] userID not found in context, skipping shared KB lookup")
-		return chunks, nil
-	}
-	userID, ok := userIDVal.(string)
-	if !ok || userID == "" {
-		logger.Warnf(ctx, "[listChunksByIDWithShared] userID is empty, skipping shared KB lookup")
-		return chunks, nil
-	}
-
-	logger.Infof(ctx, "[listChunksByIDWithShared] Looking up %d missing chunks with userID=%s", len(missing), userID)
-	crossChunks, err := s.chunkRepo.ListChunksByIDOnly(ctx, missing)
-	if err != nil {
-		logger.Warnf(ctx, "[listChunksByIDWithShared] Failed to fetch chunks by ID only: %v", err)
-		return chunks, nil
-	}
-	logger.Infof(ctx, "[listChunksByIDWithShared] Found %d chunks without tenant filter", len(crossChunks))
-
-	for _, c := range crossChunks {
-		if c == nil || c.KnowledgeBaseID == "" {
-			continue
-		}
-		hasPermission, err := s.kbShareService.HasKBPermission(ctx, c.KnowledgeBaseID, userID, types.OrgRoleViewer)
-		if err != nil {
-			logger.Debugf(ctx, "[listChunksByIDWithShared] Permission check error for KB %s: %v", c.KnowledgeBaseID, err)
-			continue
-		}
-		if !hasPermission {
-			logger.Debugf(ctx, "[listChunksByIDWithShared] No permission for KB %s", c.KnowledgeBaseID)
-			continue
-		}
-		chunks = append(chunks, c)
-	}
-
-	logger.Infof(ctx, "[listChunksByIDWithShared] After shared lookup, total chunks: %d", len(chunks))
-	return chunks, nil
+	return &targetKB, nil
 }

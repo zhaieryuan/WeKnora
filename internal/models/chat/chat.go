@@ -26,33 +26,55 @@ type FunctionDef struct {
 
 // ChatOptions 聊天选项
 type ChatOptions struct {
-	Temperature         float64         `json:"temperature"`           // 温度参数
-	TopP                float64         `json:"top_p"`                 // Top P 参数
-	Seed                int             `json:"seed"`                  // 随机种子
-	MaxTokens           int             `json:"max_tokens"`            // 最大 token 数
-	MaxCompletionTokens int             `json:"max_completion_tokens"` // 最大完成 token 数
-	FrequencyPenalty    float64         `json:"frequency_penalty"`     // 频率惩罚
-	PresencePenalty     float64         `json:"presence_penalty"`      // 存在惩罚
-	Thinking            *bool           `json:"thinking"`              // 是否启用思考
-	Tools               []Tool          `json:"tools,omitempty"`       // 可用工具列表
-	ToolChoice          string          `json:"tool_choice,omitempty"` // "auto", "required", "none", or specific tool
-	Format              json.RawMessage `json:"format,omitempty"`      // 响应格式定义
+	Temperature         float64         `json:"temperature"`                   // 温度参数
+	TopP                float64         `json:"top_p"`                         // Top P 参数
+	Seed                int             `json:"seed"`                          // 随机种子
+	MaxTokens           int             `json:"max_tokens"`                    // 最大 token 数
+	MaxCompletionTokens int             `json:"max_completion_tokens"`         // 最大完成 token 数
+	FrequencyPenalty    float64         `json:"frequency_penalty"`             // 频率惩罚
+	PresencePenalty     float64         `json:"presence_penalty"`              // 存在惩罚
+	Thinking            *bool           `json:"thinking"`                      // 是否启用思考
+	Tools               []Tool          `json:"tools,omitempty"`               // 可用工具列表
+	ToolChoice          string          `json:"tool_choice,omitempty"`         // "auto", "required", "none", or specific tool
+	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"` // 是否允许并行工具调用（默认 nil 表示由模型决定）
+	Format              json.RawMessage `json:"format,omitempty"`              // 响应格式定义
+}
+
+// MessageContentPart represents a part of multi-content message
+type MessageContentPart struct {
+	Type     string    `json:"type"`                // "text" or "image_url"
+	Text     string    `json:"text,omitempty"`      // For type="text"
+	ImageURL *ImageURL `json:"image_url,omitempty"` // For type="image_url"
+}
+
+// ImageURL represents the image URL structure
+type ImageURL struct {
+	URL    string `json:"url"`              // URL or base64 data URI
+	Detail string `json:"detail,omitempty"` // "auto", "low", "high"
 }
 
 // Message 表示聊天消息
 type Message struct {
-	Role       string     `json:"role"`                   // 角色：system, user, assistant, tool
-	Content    string     `json:"content"`                // 消息内容
-	Name       string     `json:"name,omitempty"`         // Function/tool name (for tool role)
-	ToolCallID string     `json:"tool_call_id,omitempty"` // Tool call ID (for tool role)
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // Tool calls (for assistant role)
+	Role         string               `json:"role"`                    // 角色：system, user, assistant, tool
+	Content      string               `json:"content"`                 // 消息内容
+	MultiContent []MessageContentPart `json:"multi_content,omitempty"` // 多内容消息（文本+图片）
+	Name         string               `json:"name,omitempty"`          // Function/tool name (for tool role)
+	ToolCallID   string               `json:"tool_call_id,omitempty"`  // Tool call ID (for tool role)
+	ToolCalls    []ToolCall           `json:"tool_calls,omitempty"`    // Tool calls (for assistant role)
+	Images       []string             `json:"images,omitempty"`        // Image URLs for multimodal (only for current user message)
+	// ReasoningContent 是 assistant 推理类模型（DeepSeek thinking、小米 MiMo、vLLM reasoning 等）
+	// 上一轮输出的思考内容。部分供应商（MiMo、DeepSeek V3.2/V4 thinking 模式）要求多轮对话中
+	// 把 assistant 的 reasoning_content 原样回传，否则会以 400 拒绝请求；其他不要求的供应商
+	// 会忽略未知字段，无副作用。
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ToolCall represents a tool call in a message
 type ToolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"` // "function"
-	Function FunctionCall `json:"function"`
+	ID               string                 `json:"id"`
+	Type             string                 `json:"type"` // "function"
+	Function         FunctionCall           `json:"function"`
+	ProviderMetadata types.ToolCallMetadata `json:"provider_metadata,omitempty"`
 }
 
 // FunctionCall represents a function call
@@ -83,46 +105,68 @@ type ChatConfig struct {
 	APIKey    string
 	ModelID   string
 	Provider  string
-	Extra     map[string]any
+	// MaxConcurrency caps concurrent background calls to this model; 0 falls
+	// back to the process-wide default (see limiter.GateN).
+	MaxConcurrency int
+	ExtraConfig    map[string]string
+	// CustomHeaders 允许在调用远程 OpenAI 兼容 API 时附加自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+	CustomHeaders map[string]string
+	AppID         string
+	AppSecret     string // 加密值，由工厂函数调用方传入，在 NewWeKnoraCloudChat 中使用前已解密
+}
+
+// ConfigFromModel 根据 types.Model 构造 ChatConfig。
+// 保证生产路径（service 层根据 DB 中的模型配置拉起实例）和测试路径
+// （handler 层根据前端表单临时拉起实例）走完全相同的字段映射，避免重复样板。
+// appID / appSecret 是已经解密/解析好的 WeKnoraCloud 凭证，调用方负责传入。
+func ConfigFromModel(m *types.Model, appID, appSecret string) *ChatConfig {
+	if m == nil {
+		return nil
+	}
+	return &ChatConfig{
+		ModelID:        m.ID,
+		APIKey:         m.Parameters.APIKey,
+		BaseURL:        m.Parameters.BaseURL,
+		ModelName:      m.Name,
+		Source:         m.Source,
+		Provider:       m.Parameters.Provider,
+		MaxConcurrency: m.Parameters.MaxConcurrency,
+		ExtraConfig:    m.Parameters.ExtraConfig,
+		CustomHeaders:  m.Parameters.CustomHeaders,
+		AppID:          appID,
+		AppSecret:      appSecret,
+	}
 }
 
 // NewChat 创建聊天实例
 func NewChat(config *ChatConfig, ollamaService *ollama.OllamaService) (Chat, error) {
+	var c Chat
+	var err error
 	switch strings.ToLower(string(config.Source)) {
 	case string(types.ModelSourceLocal):
-		return NewOllamaChat(config, ollamaService)
+		c, err = NewOllamaChat(config, ollamaService)
 	case string(types.ModelSourceRemote):
-		return NewRemoteChat(config)
+		c, err = NewRemoteChat(config)
 	default:
 		return nil, fmt.Errorf("unsupported chat model source: %s", config.Source)
 	}
+	c, err = wrapChatDebug(c, err)
+	c, err = wrapChatLangfuse(c, err)
+	// Outermost: hold the per-model concurrency slot only around the real
+	// provider round-trip, so the wait is excluded from debug/langfuse timing.
+	return wrapChatConcurrency(c, config.MaxConcurrency, err)
 }
 
-// NewRemoteChat 根据 provider 创建远程聊天实例
+// NewRemoteChat 根据 provider 创建远程聊天实例。
+// Anthropic 走独立的 Messages 协议实现；其余 OpenAI 兼容供应商统一由
+// RemoteAPIChat 处理，provider 特定行为在构造时通过 providerAdapter 解析。
 func NewRemoteChat(config *ChatConfig) (Chat, error) {
 	providerName := provider.ProviderName(config.Provider)
 	if providerName == "" {
 		providerName = provider.DetectProvider(config.BaseURL)
 	}
-
-	switch providerName {
-	case provider.ProviderLKEAP:
-		// LKEAP 有特殊的 thinking 参数格式
-		return NewLKEAPChat(config)
-	case provider.ProviderAliyun:
-		// 检查是否为 Qwen3 模型（需要特殊处理 enable_thinking）
-		if provider.IsQwen3Model(config.ModelName) {
-			return NewQwenChat(config)
-		}
-		return NewRemoteAPIChat(config)
-	case provider.ProviderDeepSeek:
-		// DeepSeek 不支持 tool_choice
-		return NewDeepSeekChat(config)
-	case provider.ProviderGeneric:
-		// Generic provider (如 vLLM) 使用 ChatTemplateKwargs
-		return NewGenericChat(config)
-	default:
-		// 其他 provider 使用标准 OpenAI 兼容实现
-		return NewRemoteAPIChat(config)
+	if providerName == provider.ProviderAnthropic {
+		return NewAnthropicChat(config)
 	}
+	return NewRemoteAPIChat(config)
 }

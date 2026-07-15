@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -12,8 +13,30 @@ import (
 
 var ErrKnowledgeNotFound = errors.New("knowledge not found")
 
-// omitFieldsOnUpdate defines fields to omit when updating knowledge
-var omitFieldsOnUpdate = []string{"DeletedAt"}
+// escapeLikeKeyword escapes SQL LIKE wildcards (%, _) in a keyword
+// so they are treated as literal characters.
+func escapeLikeKeyword(keyword string) string {
+	keyword = strings.ReplaceAll(keyword, `\`, `\\`)
+	keyword = strings.ReplaceAll(keyword, "%", `\%`)
+	keyword = strings.ReplaceAll(keyword, "_", `\_`)
+	return keyword
+}
+
+// omitFieldsOnUpdate defines fields to omit when updating knowledge.
+//
+// PendingSubtasksCount is deliberately omitted from every full-row Save:
+// it is an orchestration counter owned exclusively by the atomic helpers
+// SetFinalizing (seed), FinalizeSubtask (decrement+promote) and the
+// explicit UpdateKnowledgeColumns resets (cancel/reparse). A generic
+// UpdateKnowledge call persists the WHOLE in-memory struct, so any
+// concurrent enrichment subtask that loaded the row, did slow work
+// (e.g. an LLM call), then saved an unrelated field would otherwise
+// write back the STALE counter it read at load time — clobbering the
+// decrements other subtasks performed in the meantime. That made the
+// counter jump back up and never reach zero (the "stuck
+// pending_subtasks_count / never promoted to completed" bug). Omitting
+// the column here means Save can never touch it.
+var omitFieldsOnUpdate = []string{"DeletedAt", "PendingSubtasksCount"}
 
 // knowledgeRepository implements knowledge base and knowledge repository interface
 type knowledgeRepository struct {
@@ -71,62 +94,81 @@ func (r *knowledgeRepository) ListKnowledgeByKnowledgeBaseID(
 	return knowledges, nil
 }
 
+// applyKnowledgeListFilter applies the optional filter dimensions of
+// KnowledgeListFilter to a GORM query. Tenant / knowledge base scoping must be
+// applied by the caller before invoking this helper.
+func applyKnowledgeListFilter(query *gorm.DB, filter types.KnowledgeListFilter) *gorm.DB {
+	if len(filter.TagIDs) > 0 {
+		query = query.Where(
+			"knowledges.id IN (SELECT knowledge_id FROM knowledge_tag_relations WHERE tag_id IN (?))",
+			filter.TagIDs,
+		)
+	}
+	if filter.Keyword != "" {
+		// Case-insensitive (LOWER … LIKE LOWER) so keyword search matches
+		// regardless of the stored casing — consistent with the sibling
+		// LOWER() filters in this file and with the client-side `search kb`
+		// / `search sessions` filters. Plain LIKE is case-sensitive in
+		// Postgres, which surprised callers searching with lowercase.
+		escaped := strings.ToLower(escapeLikeKeyword(filter.Keyword))
+		query = query.Where("(LOWER(file_name) LIKE ? OR LOWER(title) LIKE ?)", "%"+escaped+"%", "%"+escaped+"%")
+	}
+	// FileType and Source share the same special-case routing onto `type` for
+	// the "manual" / "url" values, so callers can pick either control.
+	applyTypeOrFileType := func(q *gorm.DB, val string) *gorm.DB {
+		switch val {
+		case "":
+			return q
+		case "manual", "url":
+			return q.Where("type = ?", val)
+		default:
+			return q.Where("file_type = ?", val)
+		}
+	}
+	query = applyTypeOrFileType(query, filter.FileType)
+	if filter.Source != "" {
+		switch filter.Source {
+		case "manual", "url":
+			query = query.Where("type = ?", filter.Source)
+		default:
+			query = query.Where("channel = ?", filter.Source)
+		}
+	}
+	if filter.ParseStatus != "" {
+		query = query.Where("parse_status = ?", filter.ParseStatus)
+	}
+	if !filter.UpdatedFrom.IsZero() {
+		query = query.Where("updated_at >= ?", filter.UpdatedFrom)
+	}
+	if !filter.UpdatedTo.IsZero() {
+		query = query.Where("updated_at <= ?", filter.UpdatedTo)
+	}
+	return query
+}
+
 // ListPagedKnowledgeByKnowledgeBaseID lists all knowledge in a knowledge base with pagination
 func (r *knowledgeRepository) ListPagedKnowledgeByKnowledgeBaseID(
 	ctx context.Context,
 	tenantID uint64,
 	kbID string,
 	page *types.Pagination,
-	tagID string,
-	keyword string,
-	fileType string,
+	filter types.KnowledgeListFilter,
 ) ([]*types.Knowledge, int64, error) {
 	var knowledges []*types.Knowledge
 	var total int64
 
-	query := r.db.WithContext(ctx).Model(&types.Knowledge{}).
-		Where("tenant_id = ? AND knowledge_base_id = ?", tenantID, kbID)
-	if tagID != "" {
-		query = query.Where("tag_id = ?", tagID)
-	}
-	if keyword != "" {
-		query = query.Where("file_name LIKE ?", "%"+keyword+"%")
-	}
-	if fileType != "" {
-		if fileType == "manual" {
-			query = query.Where("type = ?", "manual")
-		} else if fileType == "url" {
-			query = query.Where("type = ?", "url")
-		} else {
-			query = query.Where("file_type = ?", fileType)
-		}
+	scope := func(q *gorm.DB) *gorm.DB {
+		return applyKnowledgeListFilter(
+			q.Where("tenant_id = ? AND knowledge_base_id = ?", tenantID, kbID),
+			filter,
+		)
 	}
 
-	// Query total count first
-	if err := query.Count(&total).Error; err != nil {
+	if err := scope(r.db.WithContext(ctx).Model(&types.Knowledge{})).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	// Then query paginated data
-	dataQuery := r.db.WithContext(ctx).
-		Where("tenant_id = ? AND knowledge_base_id = ?", tenantID, kbID)
-	if tagID != "" {
-		dataQuery = dataQuery.Where("tag_id = ?", tagID)
-	}
-	if keyword != "" {
-		dataQuery = dataQuery.Where("file_name LIKE ?", "%"+keyword+"%")
-	}
-	if fileType != "" {
-		if fileType == "manual" {
-			dataQuery = dataQuery.Where("type = ?", "manual")
-		} else if fileType == "url" {
-			dataQuery = dataQuery.Where("type = ?", "url")
-		} else {
-			dataQuery = dataQuery.Where("file_type = ?", fileType)
-		}
-	}
-
-	if err := dataQuery.
+	if err := scope(r.db.WithContext(ctx)).
 		Order("created_at DESC").
 		Offset(page.Offset()).
 		Limit(page.Limit()).
@@ -273,6 +315,141 @@ func (r *knowledgeRepository) UpdateKnowledgeColumn(
 	return err
 }
 
+// UpdateKnowledgeColumns writes multiple columns in a single UPDATE so callers
+// that flip related fields together (parse_status + error_message after
+// dead-letter, for example) cannot leave the row half-updated when the second
+// write fails.
+func (r *knowledgeRepository) UpdateKnowledgeColumns(
+	ctx context.Context,
+	id string,
+	values map[string]interface{},
+) error {
+	if len(values) == 0 {
+		return nil
+	}
+	return r.db.WithContext(ctx).Model(&types.Knowledge{}).Where("id = ?", id).Updates(values).Error
+}
+
+// UpdateActiveDeletingKnowledgeColumns only touches rows that are still visible
+// to normal queries and have not moved out of the transient deleting state.
+func (r *knowledgeRepository) UpdateActiveDeletingKnowledgeColumns(
+	ctx context.Context,
+	id string,
+	values map[string]interface{},
+) (bool, error) {
+	if len(values) == 0 {
+		return false, nil
+	}
+	result := r.db.WithContext(ctx).
+		Model(&types.Knowledge{}).
+		Where("id = ? AND parse_status = ?", id, types.ParseStatusDeleting).
+		Updates(values)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// FinalizeSubtask atomically decrements pending_subtasks_count and, when
+// the counter reaches zero while parse_status is still 'finalizing',
+// flips the row to 'completed' in the same statement so concurrent
+// subtask completions can't race the promotion.
+//
+// Returns (newCount, promoted, error). promoted is true iff this caller
+// was the one whose UPDATE flipped 'finalizing'→'completed'.
+//
+// The implementation is two statements (atomic decrement, then a guarded
+// promote UPDATE) because GORM does not expose a portable RETURNING
+// across PostgreSQL and SQLite. The promote UPDATE's WHERE clause
+// (parse_status='finalizing' AND pending_subtasks_count=0) makes it
+// safe to run from any number of concurrent callers — at most one wins.
+func (r *knowledgeRepository) FinalizeSubtask(
+	ctx context.Context, id string,
+) (int, bool, error) {
+	now := time.Now()
+	// 1) Atomic decrement, clamped at zero. The `pending_subtasks_count > 0`
+	//    guard is purely a safety net for accounting bugs — under normal
+	//    operation each subtask handler decrements at most once per task,
+	//    so the counter cannot go negative.
+	res := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Where("id = ? AND pending_subtasks_count > 0", id).
+		Updates(map[string]interface{}{
+			"pending_subtasks_count": gorm.Expr("pending_subtasks_count - 1"),
+			"updated_at":             now,
+		})
+	if res.Error != nil {
+		return 0, false, res.Error
+	}
+
+	// 2) Guarded promote. EVERY caller unconditionally attempts this after
+	//    decrementing — we must NOT gate it on a separate SELECT of the
+	//    counter. That read can be served by a lagging read-replica (or a
+	//    stale connection snapshot) and return a non-zero value even after
+	//    the counter has truly reached zero on the primary; if every caller
+	//    trusts that stale read, NONE of them runs the promote and the row
+	//    is stranded in `finalizing` forever (the observed "stuck
+	//    pending_subtasks_count" bug). The promote is a WRITE, so it executes
+	//    on the primary and its `pending_subtasks_count = 0` WHERE clause is
+	//    the single authoritative, atomic check on the live row: only the
+	//    caller whose decrement actually brought the counter to zero matches,
+	//    and cancel/delete cannot be clobbered by a late promote.
+	promoteRes := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Where("id = ? AND parse_status = ? AND pending_subtasks_count = 0",
+			id, types.ParseStatusFinalizing).
+		Updates(map[string]interface{}{
+			"parse_status": types.ParseStatusCompleted,
+			"processed_at": now,
+			"updated_at":   now,
+		})
+	if promoteRes.Error != nil {
+		return 0, false, promoteRes.Error
+	}
+	promoted := promoteRes.RowsAffected > 0
+
+	// 3) Best-effort re-read of the new count for diagnostics/return value
+	//    only. This read may be replica-stale and is intentionally NOT used
+	//    to decide whether to promote (see above). A read failure here does
+	//    not affect correctness, so we don't propagate it as an error.
+	var snap struct {
+		PendingSubtasksCount int `gorm:"column:pending_subtasks_count"`
+	}
+	if err := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Select("pending_subtasks_count").
+		Where("id = ?", id).Take(&snap).Error; err != nil {
+		return 0, promoted, nil
+	}
+	return snap.PendingSubtasksCount, promoted, nil
+}
+
+// SetFinalizing atomically transitions a row from 'processing' to
+// 'finalizing' and seeds pending_subtasks_count. Used by
+// KnowledgePostProcess.Handle as the single durable handoff between
+// the synchronous parse stage and the asynchronous enrichment fan-out.
+//
+// The transition is conditional on parse_status='processing' so a row
+// that the user cancelled / deleted between ProcessDocument finishing
+// and post-process starting will NOT get hijacked into finalizing.
+// Returns whether the transition happened.
+func (r *knowledgeRepository) SetFinalizing(
+	ctx context.Context, id string, expectedSubtasks int,
+) (bool, error) {
+	if expectedSubtasks < 0 {
+		expectedSubtasks = 0
+	}
+	now := time.Now()
+	res := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Where("id = ? AND parse_status = ?", id, types.ParseStatusProcessing).
+		Updates(map[string]interface{}{
+			"parse_status":           types.ParseStatusFinalizing,
+			"pending_subtasks_count": expectedSubtasks,
+			"updated_at":             now,
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+
 // CountKnowledgeByKnowledgeBaseID counts the number of knowledge items in a knowledge base
 func (r *knowledgeRepository) CountKnowledgeByKnowledgeBaseID(
 	ctx context.Context,
@@ -313,6 +490,29 @@ func (r *knowledgeRepository) CountKnowledgeByStatus(
 // If keyword is empty, returns recent files
 // Only returns documents from document-type knowledge bases (excludes FAQ)
 // Returns (results, hasMore, error)
+// FindByMetadataKey finds a knowledge item by a key-value pair in the metadata JSON column.
+// Uses Postgres jsonb operator: metadata->>'key' = 'value'.
+func (r *knowledgeRepository) FindByMetadataKey(
+	ctx context.Context,
+	tenantID uint64,
+	kbID string,
+	key string,
+	value string,
+) (*types.Knowledge, error) {
+	var knowledge types.Knowledge
+	err := r.db.WithContext(ctx).
+		Where("tenant_id = ? AND knowledge_base_id = ? AND deleted_at IS NULL", tenantID, kbID).
+		Where("metadata->>? = ?", key, value).
+		First(&knowledge).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &knowledge, nil
+}
+
 func (r *knowledgeRepository) SearchKnowledge(
 	ctx context.Context,
 	tenantID uint64,
@@ -335,18 +535,23 @@ func (r *knowledgeRepository) SearchKnowledge(
 		Where("knowledge_bases.type = ?", types.KnowledgeBaseTypeDocument).
 		Where("knowledges.deleted_at IS NULL")
 
-	// If keyword is provided, filter by file_name or title
+	// If keyword is provided, filter by file_name or title (case-insensitive).
 	if keyword != "" {
-		query = query.Where("knowledges.file_name LIKE ? ", "%"+keyword+"%")
+		escaped := strings.ToLower(escapeLikeKeyword(keyword))
+		query = query.Where("(LOWER(knowledges.file_name) LIKE ? OR LOWER(knowledges.title) LIKE ?)", "%"+escaped+"%", "%"+escaped+"%")
 	}
 
-	// If fileTypes is provided, filter by file extension
+	// If fileTypes is provided, filter by file extension or type
 	if len(fileTypes) > 0 {
-		// Build file extension patterns (e.g., "%.csv", "%.xlsx")
 		seen := make(map[string]bool)
 		var uniquePatterns []string
+		includeURL := false
 		for _, ft := range fileTypes {
 			ft = strings.ToLower(strings.TrimPrefix(ft, "."))
+			if ft == "url" || ft == "html" {
+				includeURL = true
+				continue
+			}
 			pattern := "%." + ft
 			if !seen[pattern] {
 				seen[pattern] = true
@@ -377,14 +582,17 @@ func (r *knowledgeRepository) SearchKnowledge(
 				}
 			}
 		}
-		// Build OR conditions for file extensions
-		if len(uniquePatterns) > 0 {
-			orConditions := make([]string, len(uniquePatterns))
-			args := make([]interface{}, len(uniquePatterns))
-			for i, p := range uniquePatterns {
-				orConditions[i] = "LOWER(knowledges.file_name) LIKE ?"
-				args[i] = p
-			}
+		var orConditions []string
+		var args []interface{}
+		for _, p := range uniquePatterns {
+			orConditions = append(orConditions, "LOWER(knowledges.file_name) LIKE ?")
+			args = append(args, p)
+		}
+		if includeURL {
+			orConditions = append(orConditions, "knowledges.type = ?")
+			args = append(args, "url")
+		}
+		if len(orConditions) > 0 {
 			query = query.Where("("+strings.Join(orConditions, " OR ")+")", args...)
 		}
 	}
@@ -421,9 +629,9 @@ func (r *knowledgeRepository) SearchKnowledgeInScopes(
 	keyword string,
 	offset, limit int,
 	fileTypes []string,
-) ([]*types.Knowledge, bool, error) {
+) ([]*types.Knowledge, bool, int64, error) {
 	if len(scopes) == 0 {
-		return nil, false, nil
+		return nil, false, 0, nil
 	}
 
 	type KnowledgeWithKBName struct {
@@ -448,14 +656,20 @@ func (r *knowledgeRepository) SearchKnowledgeInScopes(
 		Where("knowledges.deleted_at IS NULL")
 
 	if keyword != "" {
-		query = query.Where("knowledges.file_name LIKE ?", "%"+keyword+"%")
+		escaped := strings.ToLower(escapeLikeKeyword(keyword))
+		query = query.Where("(LOWER(knowledges.file_name) LIKE ? OR LOWER(knowledges.title) LIKE ?)", "%"+escaped+"%", "%"+escaped+"%")
 	}
 
 	if len(fileTypes) > 0 {
 		seen := make(map[string]bool)
 		var uniquePatterns []string
+		includeURL := false
 		for _, ft := range fileTypes {
 			ft = strings.ToLower(strings.TrimPrefix(ft, "."))
+			if ft == "url" || ft == "html" {
+				includeURL = true
+				continue
+			}
 			pattern := "%." + ft
 			if !seen[pattern] {
 				seen[pattern] = true
@@ -485,15 +699,24 @@ func (r *knowledgeRepository) SearchKnowledgeInScopes(
 				}
 			}
 		}
-		if len(uniquePatterns) > 0 {
-			orConditions := make([]string, len(uniquePatterns))
-			ftArgs := make([]interface{}, len(uniquePatterns))
-			for i, p := range uniquePatterns {
-				orConditions[i] = "LOWER(knowledges.file_name) LIKE ?"
-				ftArgs[i] = p
-			}
+		var orConditions []string
+		var ftArgs []interface{}
+		for _, p := range uniquePatterns {
+			orConditions = append(orConditions, "LOWER(knowledges.file_name) LIKE ?")
+			ftArgs = append(ftArgs, p)
+		}
+		if includeURL {
+			orConditions = append(orConditions, "knowledges.type = ?")
+			ftArgs = append(ftArgs, "url")
+		}
+		if len(orConditions) > 0 {
 			query = query.Where("("+strings.Join(orConditions, " OR ")+")", ftArgs...)
 		}
+	}
+
+	var total int64
+	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+		return nil, false, 0, err
 	}
 
 	var results []KnowledgeWithKBName
@@ -502,7 +725,7 @@ func (r *knowledgeRepository) SearchKnowledgeInScopes(
 		Limit(limit + 1).
 		Scan(&results).Error
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	hasMore := len(results) > limit
@@ -516,18 +739,25 @@ func (r *knowledgeRepository) SearchKnowledgeInScopes(
 		k.KnowledgeBaseName = r.KnowledgeBaseName
 		knowledges[i] = &k
 	}
-	return knowledges, hasMore, nil
+	return knowledges, hasMore, total, nil
 }
 
-// ListIDsByTagID returns all knowledge IDs that have the specified tag ID
-func (r *knowledgeRepository) ListIDsByTagID(
+// ListIDsByTagIDs returns all knowledge IDs that have any of the specified tag IDs (OR semantics)
+func (r *knowledgeRepository) ListIDsByTagIDs(
 	ctx context.Context,
 	tenantID uint64,
-	kbID, tagID string,
+	kbID string,
+	tagIDs []string,
 ) ([]string, error) {
+	if len(tagIDs) == 0 {
+		return nil, nil
+	}
 	var ids []string
 	err := r.db.WithContext(ctx).Model(&types.Knowledge{}).
-		Where("tenant_id = ? AND knowledge_base_id = ? AND tag_id = ?", tenantID, kbID, tagID).
-		Pluck("id", &ids).Error
+		Joins("JOIN knowledge_tag_relations ktr ON knowledges.id = ktr.knowledge_id").
+		Where("knowledges.tenant_id = ? AND knowledges.knowledge_base_id = ? AND ktr.tag_id IN (?)",
+			tenantID, kbID, tagIDs).
+		Distinct("knowledges.id").
+		Pluck("knowledges.id", &ids).Error
 	return ids, err
 }

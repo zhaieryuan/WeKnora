@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
@@ -164,6 +165,33 @@ func (s *minioFileService) DeleteFile(ctx context.Context, filePath string) erro
 	return nil
 }
 
+// CopyFile copies an existing MinIO object to a new knowledge-owned object using a
+// server-side CopyObject (no data leaves MinIO). The destination uses the same
+// layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not a minio:// path.
+func (s *minioFileService) CopyFile(ctx context.Context,
+	srcPath string, tenantID uint64, knowledgeID string,
+) (string, error) {
+	srcKey, err := s.parseMinioFilePath(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("minio copy rejected source %q: %w", srcPath, ErrCrossBackendCopy)
+	}
+
+	ext := filepath.Ext(srcPath)
+	destKey := fmt.Sprintf("%d/%s/%s%s", tenantID, knowledgeID, uuid.New().String(), ext)
+
+	_, err = s.client.CopyObject(ctx,
+		minio.CopyDestOptions{Bucket: s.bucketName, Object: destKey},
+		minio.CopySrcOptions{Bucket: s.bucketName, Object: srcKey},
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to copy file in MinIO: %w", err)
+	}
+
+	newPath := fmt.Sprintf("minio://%s/%s", s.bucketName, destKey)
+	logger.Infof(ctx, "Copied MinIO object %s to %s", srcPath, newPath)
+	return newPath, nil
+}
+
 // SaveBytes saves bytes data to MinIO and returns the file path
 // temp parameter is ignored for MinIO (no auto-expiration support in this implementation)
 func (s *minioFileService) SaveBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
@@ -177,7 +205,7 @@ func (s *minioFileService) SaveBytes(ctx context.Context, data []byte, tenantID 
 	// Upload bytes to MinIO
 	reader := bytes.NewReader(data)
 	_, err = s.client.PutObject(ctx, s.bucketName, objectName, reader, int64(len(data)), minio.PutObjectOptions{
-		ContentType: "text/csv; charset=utf-8",
+		ContentType: utils.GetContentTypeByExt(ext),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to upload bytes to MinIO: %w", err)

@@ -198,16 +198,27 @@ func (c *Client) GenerateTitle(ctx context.Context, sessionID string, request *G
 	return response.Data, nil
 }
 
+// ImageAttachment represents an image in a chat request.
+// Frontend sends base64 data in the Data field; the backend saves, runs VLM analysis,
+// and populates URL/Caption before proceeding with the chat pipeline.
+type ImageAttachment struct {
+	Data    string `json:"data,omitempty"`    // base64 data URI (data:image/png;base64,...)
+	URL     string `json:"url,omitempty"`     // serving URL after saving to storage
+	Caption string `json:"caption,omitempty"` // VLM analysis result
+}
+
 // KnowledgeQARequest knowledge Q&A request
 type KnowledgeQARequest struct {
-	Query            string   `json:"query"`              // Query text for knowledge base search
-	KnowledgeBaseIDs []string `json:"knowledge_base_ids"` // Selected knowledge base IDs for this request
-	KnowledgeIDs     []string `json:"knowledge_ids"`      // Selected knowledge IDs for this request
-	AgentEnabled     bool     `json:"agent_enabled"`      // Whether agent mode is enabled for this request
-	AgentID          string   `json:"agent_id"`           // Selected custom agent ID for this request
-	WebSearchEnabled bool     `json:"web_search_enabled"` // Whether web search is enabled for this request
-	SummaryModelID   string   `json:"summary_model_id"`   // Optional summary model ID (overrides session default)
-	DisableTitle     bool     `json:"disable_title"`      // Whether to disable auto title generation
+	Query            string            `json:"query"`              // Query text for knowledge base search
+	KnowledgeBaseIDs []string          `json:"knowledge_base_ids"` // Selected knowledge base IDs for this request
+	KnowledgeIDs     []string          `json:"knowledge_ids"`      // Selected knowledge IDs for this request
+	AgentEnabled     bool              `json:"agent_enabled"`      // Whether agent mode is enabled for this request
+	AgentID          string            `json:"agent_id"`           // Selected custom agent ID for this request
+	WebSearchEnabled bool              `json:"web_search_enabled"` // Whether web search is enabled for this request
+	SummaryModelID   string            `json:"summary_model_id"`   // Optional summary model ID (overrides session default)
+	DisableTitle     bool              `json:"disable_title"`      // Whether to disable auto title generation
+	Images           []ImageAttachment `json:"images,omitempty"`   // Attached images for multimodal chat
+	Channel          string            `json:"channel,omitempty"`  // Source channel: "web", "api", "im", etc.
 }
 
 // LLMToolCall represents a function/tool call from the LLM
@@ -259,50 +270,58 @@ func (c *Client) KnowledgeQAStream(
 	callback func(*StreamResponse) error,
 ) error {
 	path := fmt.Sprintf("/api/v1/knowledge-chat/%s", sessionID)
-	fmt.Printf("Starting KnowledgeQAStream request, session ID: %s, query: %s\n", sessionID, request.Query)
+	debugLogger.Debug("knowledge_qa_stream_start", "session_id", sessionID, "query", request.Query)
 
-	resp, err := c.doRequest(ctx, http.MethodPost, path, request, nil)
+	resp, err := c.doRequestStream(ctx, http.MethodPost, path, request, nil)
 	if err != nil {
-		fmt.Printf("Request failed: %v\n", err)
+		debugLogger.Debug("request_failed", "error", err)
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		err := fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
-		fmt.Printf("Request returned error status: %v\n", err)
+		err := newAPIError(resp.StatusCode, body)
+		debugLogger.Debug("request_error_status", "error", err)
 		return err
 	}
 
-	fmt.Println("Successfully established SSE connection, processing data stream")
+	debugLogger.Debug("sse_connection_established")
 
 	// Use bufio to read SSE data line by line
 	scanner := bufio.NewScanner(resp.Body)
+	// Default 64KiB per-line cap truncates large SSE data lines (the
+	// references event bundles chunk contents that can reach hundreds of
+	// KiB). Raise the cap so those lines parse instead of erroring with
+	// "bufio.Scanner: token too long".
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var dataBuffer string
 	var eventType string
 	messageCount := 0
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		fmt.Printf("Received SSE line: %s\n", line)
+		debugLogger.Debug("sse_line_received", "line", line)
 
 		// Empty line indicates the end of an event
 		if line == "" {
 			if dataBuffer != "" {
-				fmt.Printf("Processing data: %s, event type: %s\n", dataBuffer, eventType)
+				debugLogger.Debug("sse_data_processing", "data", dataBuffer, "event_type", eventType)
 				var streamResponse StreamResponse
 				if err := json.Unmarshal([]byte(dataBuffer), &streamResponse); err != nil {
-					fmt.Printf("Failed to parse SSE data: %v\n", err)
+					debugLogger.Debug("sse_parse_failed", "error", err)
 					return fmt.Errorf("failed to parse SSE data: %w", err)
 				}
 
 				messageCount++
-				fmt.Printf("Parsed message #%d, done status: %v\n", messageCount, streamResponse.Done)
+				debugLogger.Debug("sse_message_parsed", "count", messageCount, "done", streamResponse.Done)
 
 				if err := callback(&streamResponse); err != nil {
-					fmt.Printf("Callback processing failed: %v\n", err)
+					debugLogger.Debug("sse_callback_failed", "error", err)
 					return err
+				}
+				if streamResponse.ResponseType == ResponseTypeError && streamResponse.Done {
+					return NewSSEStreamError(streamResponse.Content)
 				}
 				dataBuffer = ""
 				eventType = ""
@@ -313,7 +332,7 @@ func (c *Client) KnowledgeQAStream(
 		// Process lines with event: prefix
 		if strings.HasPrefix(line, "event:") {
 			eventType = line[6:] // Remove "event:" prefix
-			fmt.Printf("Set event type: %s\n", eventType)
+			debugLogger.Debug("sse_event_type_set", "event_type", eventType)
 		}
 
 		// Process lines with data: prefix
@@ -323,11 +342,11 @@ func (c *Client) KnowledgeQAStream(
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Printf("Failed to read SSE stream: %v\n", err)
+		debugLogger.Debug("sse_read_failed", "error", err)
 		return fmt.Errorf("failed to read SSE stream: %w", err)
 	}
 
-	fmt.Printf("KnowledgeQAStream completed, processed %d messages\n", messageCount)
+	debugLogger.Debug("knowledge_qa_stream_completed", "message_count", messageCount)
 	return nil
 }
 
@@ -343,7 +362,7 @@ func (c *Client) ContinueStream(
 	queryParams := url.Values{}
 	queryParams.Add("message_id", messageID)
 
-	resp, err := c.doRequest(ctx, http.MethodGet, path, nil, queryParams)
+	resp, err := c.doRequestStream(ctx, http.MethodGet, path, nil, queryParams)
 	if err != nil {
 		return err
 	}
@@ -351,11 +370,14 @@ func (c *Client) ContinueStream(
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
+		return newAPIError(resp.StatusCode, body)
 	}
 
 	// Use bufio to read SSE data line by line
 	scanner := bufio.NewScanner(resp.Body)
+	// See KnowledgeQAStream: raise the per-line cap so large SSE data lines
+	// (references event) parse instead of erroring with "token too long".
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var dataBuffer string
 	var eventType string
 
@@ -372,6 +394,9 @@ func (c *Client) ContinueStream(
 
 				if err := callback(&streamResponse); err != nil {
 					return err
+				}
+				if streamResponse.ResponseType == ResponseTypeError && streamResponse.Done {
+					return NewSSEStreamError(streamResponse.Content)
 				}
 				dataBuffer = ""
 				eventType = ""
@@ -424,10 +449,12 @@ func (c *Client) StopSession(ctx context.Context, sessionID string, messageID st
 
 // SearchKnowledgeRequest knowledge search request
 type SearchKnowledgeRequest struct {
-	Query            string   `json:"query"`                        // Query content
-	KnowledgeBaseID  string   `json:"knowledge_base_id,omitempty"`  // Single knowledge base ID (for backward compatibility)
-	KnowledgeBaseIDs []string `json:"knowledge_base_ids,omitempty"` // Knowledge base IDs (multi-KB support)
-	KnowledgeIDs     []string `json:"knowledge_ids,omitempty"`      // Specific knowledge (file) IDs
+	Query            string          `json:"query"`                        // Query content
+	KnowledgeBaseID  string          `json:"knowledge_base_id,omitempty"`  // Single knowledge base ID (for backward compatibility)
+	KnowledgeBaseIDs []string        `json:"knowledge_base_ids,omitempty"` // Knowledge base IDs (multi-KB support)
+	KnowledgeIDs     []string        `json:"knowledge_ids,omitempty"`      // Specific knowledge (file) IDs
+	TagIDs           []string        `json:"tag_ids,omitempty"`            // Tag IDs for filtering within a single KB
+	MentionedItems   []MentionedItem `json:"mentioned_items,omitempty"`    // Optional scoped tag mentions
 }
 
 // SearchKnowledgeResponse search results response
@@ -438,29 +465,32 @@ type SearchKnowledgeResponse struct {
 
 // SearchKnowledge performs knowledge base search without LLM summarization
 func (c *Client) SearchKnowledge(ctx context.Context, request *SearchKnowledgeRequest) ([]*SearchResult, error) {
-	fmt.Printf("Starting SearchKnowledge request, knowledge base IDs: %v, knowledge IDs: %v, query: %s\n",
-		request.KnowledgeBaseIDs, request.KnowledgeIDs, request.Query)
+	debugLogger.Debug("search_knowledge_start",
+		"knowledge_base_ids", request.KnowledgeBaseIDs,
+		"knowledge_ids", request.KnowledgeIDs,
+		"query", request.Query,
+	)
 
 	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/knowledge-search", request, nil)
 	if err != nil {
-		fmt.Printf("Request failed: %v\n", err)
+		debugLogger.Debug("request_failed", "error", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		err := fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
-		fmt.Printf("Request returned error status: %v\n", err)
+		err := newAPIError(resp.StatusCode, body)
+		debugLogger.Debug("request_error_status", "error", err)
 		return nil, err
 	}
 
 	var response SearchKnowledgeResponse
 	if err := parseResponse(resp, &response); err != nil {
-		fmt.Printf("Failed to parse response: %v\n", err)
+		debugLogger.Debug("response_parse_failed", "error", err)
 		return nil, err
 	}
 
-	fmt.Printf("SearchKnowledge completed, found %d results\n", len(response.Data))
+	debugLogger.Debug("search_knowledge_completed", "result_count", len(response.Data))
 	return response.Data, nil
 }

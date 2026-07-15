@@ -9,7 +9,7 @@
 1. **会话管理**：创建、获取、更新和删除会话
 2. **知识库管理**：创建、获取、更新和删除知识库
 3. **知识管理**：添加、获取和删除知识内容
-4. **租户管理**：租户的CRUD操作
+4. **空间管理**：空间的CRUD操作
 5. **知识问答**：支持普通问答和流式问答
 6. **Agent问答**：支持基于Agent的智能问答，包含思考过程、工具调用和反思
 7. **分块管理**：查询、更新和删除知识分块
@@ -23,7 +23,7 @@
 ```go
 import (
     "context"
-    "github.com/Tencent/WeKnora/internal/client"
+    "github.com/Tencent/WeKnora/client"
     "time"
 )
 
@@ -33,6 +33,26 @@ apiClient := client.NewClient(
     client.WithToken("your-auth-token"),
     client.WithTimeout(30*time.Second),
 )
+```
+
+### 空间配置
+
+客户端支持通过 `WithTenantID` 设置默认空间，请求时会自动携带 `X-Tenant-ID` 请求头：
+
+```go
+tenantID := uint64(10000)
+apiClient := client.NewClient(
+    "http://api.example.com",
+    client.WithToken("your-auth-token"),
+    client.WithTenantID(tenantID),
+)
+```
+
+如果某个请求需要临时切换空间，可以在 `context` 中设置 `TenantID`，值可以是 `uint64`、`*uint64` 或字符串形式的数字，客户端会优先使用该值：
+
+```go
+ctx := context.WithValue(context.Background(), "TenantID", uint64(10000))
+// 调用任意客户端方法时传入 ctx，即可切换到空间 10000
 ```
 
 ### 示例：创建知识库并上传文件
@@ -316,6 +336,36 @@ for {
         fmt.Printf("Knowledge re-parsing failed: %s\n", knowledge.ErrorMessage)
         break
     }
+}
+```
+
+### 示例：取消解析
+
+```go
+// 取消正在进行的解析任务（资源紧张 / 上传错误文件时使用）
+// - 已经 completed / failed 的知识不能取消
+// - 已写入的分块/索引会保留，可后续调用 ReparseKnowledge 重新解析
+
+knowledge, err := apiClient.CancelKnowledgeParse(context.Background(), knowledgeID)
+if err != nil {
+    // 处理错误
+}
+fmt.Printf("Parse Status: %s\n", knowledge.ParseStatus) // "cancelled"
+```
+
+### 示例：查看文档解析追踪（Span 树）
+
+```go
+// 获取文档解析流水线的 Span 树（root → stage → subspan）
+// - attempt 传 0 表示获取最新一次解析尝试
+// - 始终返回 5 个标准阶段：docreader / chunking / embedding / multimodal / postprocess
+trace, err := apiClient.GetKnowledgeProcessingSpans(context.Background(), knowledgeID, 0)
+if err != nil {
+    // 处理错误
+}
+fmt.Printf("ParseStatus=%s CurrentStage=%s\n", trace.ParseStatus, trace.CurrentStage)
+for _, stage := range trace.Trace.Children {
+    fmt.Printf("- %s: %s (%dms)\n", stage.Name, stage.Status, stage.DurationMs)
 }
 ```
 

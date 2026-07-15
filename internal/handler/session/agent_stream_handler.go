@@ -2,10 +2,13 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -20,6 +23,8 @@ type AgentStreamHandler struct {
 	sessionID          string
 	assistantMessageID string
 	requestID          string
+	receivedAt         time.Time // Handler entry timestamp, used for TTFB logging
+	ttfbLogged         bool      // Guards one-shot TTFB log on first answer chunk
 	assistantMessage   *types.Message
 	streamManager      interfaces.StreamManager
 
@@ -28,14 +33,50 @@ type AgentStreamHandler struct {
 	// State tracking
 	knowledgeRefs   []*types.SearchResult
 	finalAnswer     string
+	answerSegments  []*answerSegment     // Per-answer-event-ID accumulation, so superseded preambles can be dropped
 	eventStartTimes map[string]time.Time // Track start time for duration calculation
 	mu              sync.Mutex
+}
+
+// answerSegment accumulates the streamed content of a single final-answer event
+// ID. A non-terminal round may stream a preamble ("let me search…") under its
+// own answer ID and then be marked superseded once the round turns out to call
+// tools; tracking segments separately lets us exclude that preamble from the
+// persisted assistant message instead of leaking it into the final answer.
+type answerSegment struct {
+	id         string
+	content    string
+	superseded bool
+}
+
+// findAnswerSegment returns the segment for an answer event ID, or nil.
+// Callers must hold h.mu.
+func (h *AgentStreamHandler) findAnswerSegment(id string) *answerSegment {
+	for _, seg := range h.answerSegments {
+		if seg.id == id {
+			return seg
+		}
+	}
+	return nil
+}
+
+// composeFinalAnswer rebuilds the persisted answer from all non-superseded
+// segments in arrival order. Callers must hold h.mu.
+func (h *AgentStreamHandler) composeFinalAnswer() string {
+	var b strings.Builder
+	for _, seg := range h.answerSegments {
+		if !seg.superseded {
+			b.WriteString(seg.content)
+		}
+	}
+	return b.String()
 }
 
 // NewAgentStreamHandler creates a new handler for agent SSE streaming
 func NewAgentStreamHandler(
 	ctx context.Context,
 	sessionID, assistantMessageID, requestID string,
+	receivedAt time.Time,
 	assistantMessage *types.Message,
 	streamManager interfaces.StreamManager,
 	eventBus *event.EventBus,
@@ -45,6 +86,7 @@ func NewAgentStreamHandler(
 		sessionID:          sessionID,
 		assistantMessageID: assistantMessageID,
 		requestID:          requestID,
+		receivedAt:         receivedAt,
 		assistantMessage:   assistantMessage,
 		streamManager:      streamManager,
 		eventBus:           eventBus,
@@ -66,6 +108,10 @@ func (h *AgentStreamHandler) Subscribe() {
 	h.eventBus.On(event.EventError, h.handleError)
 	h.eventBus.On(event.EventSessionTitle, h.handleSessionTitle)
 	h.eventBus.On(event.EventAgentComplete, h.handleComplete)
+	h.eventBus.On(event.EventToolApprovalRequired, h.handleToolApprovalRequired)
+	h.eventBus.On(event.EventToolApprovalResolved, h.handleToolApprovalResolved)
+	h.eventBus.On(event.EventMCPOAuthRequired, h.handleMCPOAuthRequired)
+	h.eventBus.On(event.EventMCPOAuthResolved, h.handleMCPOAuthResolved)
 }
 
 // handleThought handles agent thought events
@@ -126,6 +172,20 @@ func (h *AgentStreamHandler) handleToolCall(ctx context.Context, evt event.Event
 	h.mu.Lock()
 	// Track start time for this tool call (use tool_call_id as key)
 	h.eventStartTimes[data.ToolCallID] = time.Now()
+	// Any answer text streamed before this tool call was a non-terminal round's
+	// preamble, not the final answer (the agent only ends by stopping naturally
+	// with plain text and no tool calls). Drop those segments from the persisted
+	// answer so the preamble never leaks into Message.Content.
+	supersededAny := false
+	for _, seg := range h.answerSegments {
+		if !seg.superseded && seg.content != "" {
+			seg.superseded = true
+			supersededAny = true
+		}
+	}
+	if supersededAny {
+		h.finalAnswer = h.composeFinalAnswer()
+	}
 	h.mu.Unlock()
 
 	metadata := map[string]interface{}{
@@ -170,10 +230,10 @@ func (h *AgentStreamHandler) handleToolResult(ctx context.Context, evt event.Eve
 
 	// Send SSE response (both success and failure)
 	responseType := types.ResponseTypeToolResult
-	content := data.Output
+	content := agenttools.StreamContentForToolResult(data.ToolName, data.Success, data.Error, data.Data)
 	if !data.Success {
 		responseType = types.ResponseTypeError
-		if data.Error != "" {
+		if content == "" && data.Error != "" {
 			content = data.Error
 		}
 	}
@@ -182,17 +242,19 @@ func (h *AgentStreamHandler) handleToolResult(ctx context.Context, evt event.Eve
 	metadata := map[string]interface{}{
 		"tool_name":    data.ToolName,
 		"success":      data.Success,
-		"output":       data.Output,
 		"error":        data.Error,
 		"duration_ms":  durationMs,
 		"tool_call_id": data.ToolCallID,
 	}
 
-	// Merge tool result data (contains display_type, formatted results, etc.)
-	if data.Data != nil {
-		for k, v := range data.Data {
-			metadata[k] = v
-		}
+	clientData := agenttools.SanitizeToolResultForClient(data.ToolName, &types.ToolResult{
+		Success: data.Success,
+		Output:  data.Output,
+		Error:   data.Error,
+		Data:    data.Data,
+	})
+	for k, v := range clientData {
+		metadata[k] = v
 	}
 
 	// Append event to stream
@@ -207,6 +269,103 @@ func (h *AgentStreamHandler) handleToolResult(ctx context.Context, evt event.Eve
 		logger.GetLogger(h.ctx).Error("Append tool result event to stream failed", "error", err)
 	}
 
+	return nil
+}
+
+func toolApprovalDataToMap(v interface{}) map[string]interface{} {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return map[string]interface{}{}
+	}
+	return m
+}
+
+// handleToolApprovalRequired persists MCP tool human-approval prompts for SSE / replay (issue #1173).
+func (h *AgentStreamHandler) handleToolApprovalRequired(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.ToolApprovalRequiredData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeToolApprovalRequired,
+		Content:   "MCP tool requires human approval",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append tool approval required event failed", "error", err)
+	}
+	return nil
+}
+
+// handleToolApprovalResolved persists the outcome of a tool approval (issue #1173).
+func (h *AgentStreamHandler) handleToolApprovalResolved(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.ToolApprovalResolvedData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeToolApprovalResolved,
+		Content:   "MCP tool approval resolved",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append tool approval resolved event failed", "error", err)
+	}
+	return nil
+}
+
+// handleMCPOAuthRequired forwards an in-conversation "authorize this MCP
+// service" prompt to the SSE stream so the UI can render an Authorize card.
+func (h *AgentStreamHandler) handleMCPOAuthRequired(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.MCPOAuthRequiredData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeMCPOAuthRequired,
+		Content:   "MCP service requires OAuth authorization",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append mcp oauth required event failed", "error", err)
+	}
+	return nil
+}
+
+// handleMCPOAuthResolved forwards the outcome of an in-conversation OAuth prompt.
+func (h *AgentStreamHandler) handleMCPOAuthResolved(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.MCPOAuthResolvedData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeMCPOAuthResolved,
+		Content:   "MCP OAuth authorization resolved",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append mcp oauth resolved event failed", "error", err)
+	}
 	return nil
 }
 
@@ -232,13 +391,14 @@ func (h *AgentStreamHandler) handleReferences(ctx context.Context, evt event.Eve
 			} else if refMap, ok := ref.(map[string]interface{}); ok {
 				// Parse from map if needed
 				searchResult := &types.SearchResult{
-					ID:              getString(refMap, "id"),
-					Content:         getString(refMap, "content"),
-					Score:           getFloat64(refMap, "score"),
-					KnowledgeID:     getString(refMap, "knowledge_id"),
-					KnowledgeTitle:  getString(refMap, "knowledge_title"),
-					ChunkIndex:      int(getFloat64(refMap, "chunk_index")),
-					KnowledgeBaseID: getString(refMap, "knowledge_base_id"),
+					ID:                   getString(refMap, "id"),
+					Content:              getString(refMap, "content"),
+					Score:                getFloat64(refMap, "score"),
+					KnowledgeID:          getString(refMap, "knowledge_id"),
+					KnowledgeTitle:       getString(refMap, "knowledge_title"),
+					ChunkIndex:           int(getFloat64(refMap, "chunk_index")),
+					KnowledgeDescription: getString(refMap, "knowledge_description"),
+					KnowledgeBaseID:      getString(refMap, "knowledge_base_id"),
 				}
 
 				if meta, ok := refMap["metadata"].(map[string]interface{}); ok {
@@ -284,13 +444,34 @@ func (h *AgentStreamHandler) handleFinalAnswer(ctx context.Context, evt event.Ev
 	}
 
 	h.mu.Lock()
+
 	// Track start time on first chunk
 	if _, exists := h.eventStartTimes[evt.ID]; !exists {
 		h.eventStartTimes[evt.ID] = time.Now()
 	}
 
-	// Accumulate final answer locally for assistant message (database)
-	h.finalAnswer += data.Content
+	// Emit a one-shot TTFB log the first time *any* answer chunk reaches
+	// the stream handler. This lets us compare the backend's "request in →
+	// first token out" timing against the frontend-observed TTFB and pin
+	// down where latency lives (network vs server vs LLM).
+	if !h.ttfbLogged && !h.receivedAt.IsZero() {
+		h.ttfbLogged = true
+		ttfb := time.Since(h.receivedAt)
+		logger.GetLogger(h.ctx).Infof("TTFB:first_answer_chunk request_id=%s, session_id=%s, ttfb_ms=%d",
+			h.requestID, h.sessionID, ttfb.Milliseconds())
+	}
+
+	// Accumulate final answer locally for assistant message (database). Track
+	// per event ID so a later supersede can subtract this segment's content.
+	if data.Content != "" {
+		seg := h.findAnswerSegment(evt.ID)
+		if seg == nil {
+			seg = &answerSegment{id: evt.ID}
+			h.answerSegments = append(h.answerSegments, seg)
+		}
+		seg.content += data.Content
+		h.finalAnswer = h.composeFinalAnswer()
+	}
 	if data.IsFallback {
 		h.assistantMessage.IsFallback = true
 	}
@@ -440,8 +621,48 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 		// Update agent steps if provided
 		if data.AgentSteps != nil {
 			if steps, ok := data.AgentSteps.([]types.AgentStep); ok {
-				h.assistantMessage.AgentSteps = steps
+				h.assistantMessage.AgentSteps = agenttools.SanitizeAgentStepsForStorage(steps)
 			}
+		}
+	}
+
+	// Fallback: if no answer events were streamed but we have a final answer,
+	// emit it as answer events so the frontend can render it properly.
+	// This guards against edge cases where the LLM stops without calling final_answer.
+	if h.finalAnswer == "" && data.FinalAnswer != "" {
+		logger.GetLogger(h.ctx).Warnf(
+			"No answer events were streamed, emitting fallback answer (len=%d). "+
+				"This typically happens when: (1) model stopped naturally and content was sent as thought events, "+
+				"or (2) Ollama model returned tool calls non-incrementally. "+
+				"total_steps=%d, total_duration_ms=%d",
+			len(data.FinalAnswer), data.TotalSteps, data.TotalDurationMs,
+		)
+		fallbackID := fmt.Sprintf("answer-fallback-%d", time.Now().UnixMilli())
+		if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+			ID:        fallbackID,
+			Type:      types.ResponseTypeAnswer,
+			Content:   data.FinalAnswer,
+			Done:      false,
+			Timestamp: time.Now(),
+			Data: map[string]interface{}{
+				"event_id":    fallbackID,
+				"is_fallback": true,
+			},
+		}); err != nil {
+			logger.GetLogger(h.ctx).Errorf("Append fallback answer event failed: %v", err)
+		}
+		if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+			ID:        fallbackID,
+			Type:      types.ResponseTypeAnswer,
+			Content:   "",
+			Done:      true,
+			Timestamp: time.Now(),
+			Data: map[string]interface{}{
+				"event_id":    fallbackID,
+				"is_fallback": true,
+			},
+		}); err != nil {
+			logger.GetLogger(h.ctx).Errorf("Append fallback answer done event failed: %v", err)
 		}
 	}
 

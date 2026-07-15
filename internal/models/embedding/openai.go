@@ -10,19 +10,22 @@ import (
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 // OpenAIEmbedder implements text vectorization functionality using OpenAI API
 type OpenAIEmbedder struct {
-	apiKey               string
-	baseURL              string
-	modelName            string
-	truncatePromptTokens int
-	dimensions           int
-	modelID              string
-	httpClient           *http.Client
-	timeout              time.Duration
-	maxRetries           int
+	apiKey                    string
+	baseURL                   string
+	modelName                 string
+	truncatePromptTokens      int
+	dimensions                int
+	modelID                   string
+	httpClient                *http.Client
+	timeout                   time.Duration
+	maxRetries                int
+	customHeaders             map[string]string
+	supportsDimensionOverride bool
 	EmbedderPooler
 }
 
@@ -31,6 +34,7 @@ type OpenAIEmbedRequest struct {
 	Model                string   `json:"model"`
 	Input                []string `json:"input"`
 	EncodingFormat       string   `json:"encoding_format,omitempty"`
+	Dimensions           int      `json:"dimensions,omitempty"`
 	TruncatePromptTokens int      `json:"truncate_prompt_tokens,omitempty"`
 }
 
@@ -60,16 +64,15 @@ func NewOpenAIEmbedder(apiKey, baseURL, modelName string,
 
 	timeout := 60 * time.Second
 
-	// Create HTTP client
-	client := &http.Client{
-		Timeout: timeout,
+	if err := validateEmbeddingBaseURL(baseURL); err != nil {
+		return nil, err
 	}
 
 	return &OpenAIEmbedder{
 		apiKey:               apiKey,
 		baseURL:              baseURL,
 		modelName:            modelName,
-		httpClient:           client,
+		httpClient:           newEmbeddingHTTPClient(timeout),
 		truncatePromptTokens: truncatePromptTokens,
 		EmbedderPooler:       pooler,
 		dimensions:           dimensions,
@@ -77,6 +80,16 @@ func NewOpenAIEmbedder(apiKey, baseURL, modelName string,
 		timeout:              timeout,
 		maxRetries:           3, // Maximum retry count
 	}, nil
+}
+
+// SetCustomHeaders 设置用户自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+// 保留头（Authorization、Content-Type 等）会在发送时被自动跳过。
+func (e *OpenAIEmbedder) SetCustomHeaders(headers map[string]string) {
+	e.customHeaders = headers
+}
+
+func (e *OpenAIEmbedder) SetSupportsDimensionOverride(supported bool) {
+	e.supportsDimensionOverride = supported
 }
 
 // Embed converts text to vector
@@ -114,14 +127,27 @@ func (e *OpenAIEmbedder) doRequestWithRetry(ctx context.Context, jsonData []byte
 			}
 		}
 
-		// Rebuild request each time to ensure Body is valid
-		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
+		// Rebuild request each time to ensure Body is valid.
+		// IMPORTANT: declare `req` separately (var) so the assignment to `err`
+		// below uses the outer-scope variable, not a fresh loop-local one.
+		// Previously this read `req, err := http.NewRequestWithContext(...)`,
+		// where `:=` introduced a new `err` shadowing the outer one. The
+		// `resp, err = httpClient.Do(req)` line then wrote to the shadowed
+		// `err` only, so when all retries failed with connection errors the
+		// outer `err` stayed nil. The function returned `(nil, nil)`, and
+		// callers (BatchEmbed line 195) blindly dereferenced `resp.Body` →
+		// SIGSEGV nil-pointer panic that took down the whole process.
+		// Reproduce: stop the embedding upstream (e.g. localhost:3130), make
+		// any RAG query → backend SIGSEGV instead of returning HTTP 500.
+		var req *http.Request
+		req, err = http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
 		if err != nil {
 			logger.GetLogger(ctx).Errorf("OpenAIEmbedder failed to create request: %v", err)
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+e.apiKey)
+		secutils.ApplyCustomHeaders(req, e.customHeaders)
 
 		resp, err = e.httpClient.Do(req)
 		if err == nil {
@@ -142,11 +168,42 @@ func (e *OpenAIEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 		EncodingFormat:       "float",
 		TruncatePromptTokens: e.truncatePromptTokens,
 	}
+	if e.supportsDimensionsParam() {
+		reqBody.Dimensions = e.dimensions
+	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("OpenAIEmbedder EmbedBatch marshal request error: %v", err)
 		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	// Log request details for debugging
+	logger.GetLogger(ctx).Debugf("OpenAIEmbedder BatchEmbed: model=%s, input_count=%d, truncate_tokens=%d",
+		e.modelName, len(texts), e.truncatePromptTokens)
+
+	// Check for invalid input lengths and log details
+	hasInvalidLength := false
+	for i, text := range texts {
+		textLen := len(text)
+		textPreview := text
+		if len(textPreview) > 200 {
+			textPreview = textPreview[:200] + "..."
+		}
+
+		// Log warning if length is outside valid range [1, 8192]
+		if textLen == 0 || textLen > 8192 {
+			hasInvalidLength = true
+			logger.GetLogger(ctx).Errorf("OpenAIEmbedder BatchEmbed input[%d]: INVALID length=%d (must be [1, 8192]), preview=%s",
+				i, textLen, textPreview)
+		} else {
+			logger.GetLogger(ctx).Debugf("OpenAIEmbedder BatchEmbed input[%d]: length=%d, preview=%s",
+				i, textLen, textPreview)
+		}
+	}
+
+	if hasInvalidLength {
+		logger.GetLogger(ctx).Errorf("OpenAIEmbedder BatchEmbed: Found invalid input lengths, this will likely cause API error")
 	}
 
 	// Send request (passing jsonData instead of constructing http.Request)
@@ -167,8 +224,13 @@ func (e *OpenAIEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		logger.GetLogger(ctx).Errorf("OpenAIEmbedder EmbedBatch API error: Http Status %s", resp.Status)
-		return nil, fmt.Errorf("EmbedBatch API error: Http Status %s", resp.Status)
+		// Log detailed error response from OpenAI API
+		bodyStr := string(body)
+		if len(bodyStr) > 1000 {
+			bodyStr = bodyStr[:1000] + "... (truncated)"
+		}
+		logger.GetLogger(ctx).Errorf("OpenAIEmbedder EmbedBatch API error: Http Status %s, Response Body: %s", resp.Status, bodyStr)
+		return nil, fmt.Errorf("EmbedBatch API error: Http Status %s, Response: %s", resp.Status, bodyStr)
 	}
 
 	// Parse response
@@ -190,6 +252,10 @@ func (e *OpenAIEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 // GetModelName returns the model name
 func (e *OpenAIEmbedder) GetModelName() string {
 	return e.modelName
+}
+
+func (e *OpenAIEmbedder) supportsDimensionsParam() bool {
+	return e.supportsDimensionOverride && e.dimensions > 0
 }
 
 // GetDimensions returns the vector dimensions

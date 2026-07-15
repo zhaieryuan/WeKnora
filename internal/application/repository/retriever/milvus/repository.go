@@ -21,6 +21,7 @@ import (
 
 const (
 	envMilvusCollection   = "MILVUS_COLLECTION"
+	envMilvusMetricType   = "MILVUS_METRIC_TYPE"
 	defaultCollectionName = "weknora_embeddings"
 	fieldContent          = "content"
 	fieldSourceID         = "source_id"
@@ -40,21 +41,36 @@ var (
 		fieldKnowledgeID, fieldKnowledgeBaseID, fieldTagID, fieldIsEnabled, fieldEmbedding}
 )
 
-// NewMilvusRetrieveEngineRepository creates and initializes a new Milvus repository
-func NewMilvusRetrieveEngineRepository(client *client.Client) interfaces.RetrieveEngineRepository {
+// NewMilvusRetrieveEngineRepository creates and initializes a new Milvus repository.
+// indexCfg is optional — pass nil to use env var / default values (env path).
+func NewMilvusRetrieveEngineRepository(client *client.Client, indexCfg *types.IndexConfig) interfaces.RetrieveEngineRepository {
 	log := logger.GetLogger(context.Background())
 	log.Info("[Milvus] Initializing Milvus retriever engine repository")
 
-	collectionBaseName := os.Getenv(envMilvusCollection)
-	if collectionBaseName == "" {
-		log.Warn("[Milvus] MILVUS_COLLECTION environment variable not set, using default collection name")
-		collectionBaseName = defaultCollectionName
+	collectionBaseName := types.ResolveCollectionName(indexCfg, envMilvusCollection, defaultCollectionName)
+
+	metricType := entity.IP
+	if mt := os.Getenv(envMilvusMetricType); mt != "" {
+		switch strings.ToUpper(mt) {
+		case "COSINE":
+			metricType = entity.COSINE
+		case "L2":
+			metricType = entity.L2
+		case "IP":
+			metricType = entity.IP
+		default:
+			log.Warnf("[Milvus] Unknown MILVUS_METRIC_TYPE '%s', using default IP", mt)
+		}
 	}
+	log.Infof("[Milvus] Using metric type: %s", metricType)
 
 	res := &milvusRepository{
 		filter:             filter{},
 		client:             client,
 		collectionBaseName: collectionBaseName,
+		metricType:         metricType,
+		shardsNum:          indexCfg.GetShardsNum(0),
+		replicaNumber:      indexCfg.GetReplicaNumber(0),
 	}
 
 	log.Info("[Milvus] Successfully initialized repository")
@@ -150,7 +166,7 @@ func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) 
 
 		indexOpts := make([]client.CreateIndexOption, 0)
 		// hnsw index for embedding field
-		indexOpts = append(indexOpts, client.NewCreateIndexOption(collectionName, fieldEmbedding, index.NewHNSWIndex(entity.IP, 16, 128)))
+		indexOpts = append(indexOpts, client.NewCreateIndexOption(collectionName, fieldEmbedding, index.NewHNSWIndex(m.metricType, 16, 128)))
 		indexOpts = append(indexOpts, client.NewCreateIndexOption(collectionName, fieldContentSparse, index.NewAutoIndex(entity.BM25)))
 		// Create payload indexes for filtering
 		indexFields := []string{fieldChunkID, fieldKnowledgeID, fieldKnowledgeBaseID, fieldSourceID, fieldIsEnabled}
@@ -159,7 +175,11 @@ func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) 
 		}
 
 		// Create collection
-		err = m.client.CreateCollection(ctx, client.NewCreateCollectionOption(collectionName, schema).WithIndexOptions(indexOpts...))
+		createOpt := client.NewCreateCollectionOption(collectionName, schema).WithIndexOptions(indexOpts...)
+		if m.shardsNum > 0 {
+			createOpt = createOpt.WithShardNum(int32(m.shardsNum))
+		}
+		err = m.client.CreateCollection(ctx, createOpt)
 		if err != nil {
 			log.Errorf("[Milvus] Failed to create collection: %v", err)
 			return fmt.Errorf("failed to create collection: %w", err)
@@ -168,7 +188,11 @@ func (m *milvusRepository) ensureCollection(ctx context.Context, dimension int) 
 		log.Infof("[Milvus] Successfully created collection %s", collectionName)
 	}
 
-	loadTask, err := m.client.LoadCollection(ctx, client.NewLoadCollectionOption(collectionName))
+	loadOpt := client.NewLoadCollectionOption(collectionName)
+	if m.replicaNumber > 0 {
+		loadOpt = loadOpt.WithReplica(m.replicaNumber)
+	}
+	loadTask, err := m.client.LoadCollection(ctx, loadOpt)
 	if err != nil {
 		log.Errorf("[Milvus] Failed to load collection: %v", err)
 		return fmt.Errorf("failed to load collection: %w", err)
@@ -412,54 +436,50 @@ func (m *milvusRepository) BatchUpdateChunkEnabledStatus(ctx context.Context, ch
 			collectionName[:len(m.collectionBaseName)] != m.collectionBaseName {
 			continue
 		}
-		enabledEmbeddings, _, err := m.searchByFilter(ctx, collectionName, &universalFilterCondition{
-			Field:    fieldChunkID,
-			Operator: operatorIn,
-			Value:    enabledChunkIDs,
-		}, nil, nil)
-		if err != nil {
-			log.Warnf("[Milvus] Failed to search enabled chunks in %s: %v", collectionName, err)
-			continue
+		if err := m.updateChunkEnabledStatusInCollection(ctx, collectionName, enabledChunkIDs, true); err != nil {
+			log.Warnf("[Milvus] Failed to update enabled chunks in %s: %v", collectionName, err)
 		}
-		upsertEmbeddings := make([]*MilvusVectorEmbedding, 0, len(enabledEmbeddings))
-		for _, embedding := range enabledEmbeddings {
-			embedding.IsEnabled = true
-			upsertEmbeddings = append(upsertEmbeddings, &embedding.MilvusVectorEmbedding)
-		}
-		if len(upsertEmbeddings) > 0 {
-			enabledReq := createUpsert(collectionName, upsertEmbeddings)
-			_, err := m.client.Upsert(ctx, enabledReq)
-			if err != nil {
-				log.Warnf("[Milvus] Failed to update enabled chunks in %s: %v", collectionName, err)
-				continue
-			}
-		}
-
-		disabledEmbeddings, _, err := m.searchByFilter(ctx, collectionName, &universalFilterCondition{
-			Field:    fieldChunkID,
-			Operator: operatorIn,
-			Value:    disabledChunkIDs,
-		}, nil, nil)
-		if err != nil {
-			log.Warnf("[Milvus] Failed to search disabled chunks in %s: %v", collectionName, err)
-			continue
-		}
-		upsertEmbeddings = make([]*MilvusVectorEmbedding, 0, len(disabledEmbeddings))
-		for _, embedding := range disabledEmbeddings {
-			embedding.IsEnabled = false
-			upsertEmbeddings = append(upsertEmbeddings, &embedding.MilvusVectorEmbedding)
-		}
-		if len(upsertEmbeddings) > 0 {
-			disabledReq := createUpsert(collectionName, upsertEmbeddings)
-			_, err := m.client.Upsert(ctx, disabledReq)
-			if err != nil {
-				log.Warnf("[Milvus] Failed to update disabled chunks in %s: %v", collectionName, err)
-				continue
-			}
+		if err := m.updateChunkEnabledStatusInCollection(ctx, collectionName, disabledChunkIDs, false); err != nil {
+			log.Warnf("[Milvus] Failed to update disabled chunks in %s: %v", collectionName, err)
 		}
 	}
 
 	log.Infof("[Milvus] Batch update chunk enabled status completed")
+	return nil
+}
+
+func (m *milvusRepository) updateChunkEnabledStatusInCollection(
+	ctx context.Context,
+	collectionName string,
+	chunkIDs []string,
+	enabled bool,
+) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+
+	embeddings, _, err := m.searchByFilter(ctx, collectionName, &universalFilterCondition{
+		Field:    fieldChunkID,
+		Operator: operatorIn,
+		Value:    chunkIDs,
+	}, nil, nil)
+	if err != nil {
+		return err
+	}
+
+	upsertEmbeddings := make([]*MilvusVectorEmbedding, 0, len(embeddings))
+	for _, embedding := range embeddings {
+		embedding.IsEnabled = enabled
+		upsertEmbeddings = append(upsertEmbeddings, &embedding.MilvusVectorEmbedding)
+	}
+	if len(upsertEmbeddings) == 0 {
+		return nil
+	}
+
+	req := createUpsert(collectionName, upsertEmbeddings)
+	if _, err := m.client.Upsert(ctx, req); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1000,7 +1020,11 @@ func convertResultSet(resultSet []client.ResultSet) ([]*MilvusVectorEmbeddingWit
 		return results, scores, nil
 	}
 	set := resultSet[0]
-	resultLen := set.Fields[0].Len()
+	resultLen := set.Len()
+	if resultLen == 0 {
+		return results, scores, nil
+	}
+
 	for _, score := range set.Scores {
 		scores = append(scores, float64(score))
 	}

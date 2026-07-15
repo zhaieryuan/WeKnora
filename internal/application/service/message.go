@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -13,17 +14,21 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// regThinkIndex matches <think>...</think> blocks for stripping from KB index content.
+var regThinkIndex = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
 // messageService implements the MessageService interface for managing messaging operations
 // It handles creating, retrieving, updating, and deleting messages within sessions.
 // It reads the chat history knowledge base configuration from the tenant's ChatHistoryConfig,
 // which is managed via the settings UI.
 type messageService struct {
-	messageRepo   interfaces.MessageRepository      // Repository for message storage operations
-	sessionRepo   interfaces.SessionRepository      // Repository for session validation
-	tenantService interfaces.TenantService          // Service for tenant operations (read ChatHistoryConfig)
-	kbService     interfaces.KnowledgeBaseService   // Service for knowledge base operations (search chat history KB)
-	knowService   interfaces.KnowledgeService       // Service for knowledge operations (index/delete passages)
-	modelService  interfaces.ModelService            // Service for model operations (rerank model)
+	messageRepo    interfaces.MessageRepository    // Repository for message storage operations
+	sessionRepo    interfaces.SessionRepository    // Repository for session validation
+	tenantService  interfaces.TenantService        // Service for tenant operations (read ChatHistoryConfig)
+	kbService      interfaces.KnowledgeBaseService // Service for knowledge base operations (search chat history KB)
+	knowService    interfaces.KnowledgeService     // Service for knowledge operations (index/delete passages)
+	modelService   interfaces.ModelService         // Service for model operations (rerank model)
+	suggestionRepo interfaces.MessageSuggestionRepository
 }
 
 // NewMessageService creates a new message service instance with the required repositories
@@ -33,14 +38,16 @@ func NewMessageService(messageRepo interfaces.MessageRepository,
 	kbService interfaces.KnowledgeBaseService,
 	knowService interfaces.KnowledgeService,
 	modelService interfaces.ModelService,
+	suggestionRepo interfaces.MessageSuggestionRepository,
 ) interfaces.MessageService {
 	return &messageService{
-		messageRepo:   messageRepo,
-		sessionRepo:   sessionRepo,
-		tenantService: tenantService,
-		kbService:     kbService,
-		knowService:   knowService,
-		modelService:  modelService,
+		messageRepo:    messageRepo,
+		sessionRepo:    sessionRepo,
+		tenantService:  tenantService,
+		kbService:      kbService,
+		knowService:    knowService,
+		modelService:   modelService,
+		suggestionRepo: suggestionRepo,
 	}
 }
 
@@ -60,6 +67,14 @@ func sessionTenantIDForLookup(ctx context.Context) (uint64, bool) {
 	return 0, false
 }
 
+func sessionUserIDForLookup(ctx context.Context) string {
+	if ctx.Value(types.SessionTenantIDContextKey) != nil {
+		// Shared-agent pipelines resolve the session owner tenant first; keep that internal lookup tenant-scoped.
+		return ""
+	}
+	return types.SessionOwnerIDFromContext(ctx)
+}
+
 // CreateMessage creates a new message within an existing session
 func (s *messageService) CreateMessage(ctx context.Context, message *types.Message) (*types.Message, error) {
 	logger.Info(ctx, "Start creating message")
@@ -67,7 +82,7 @@ func (s *messageService) CreateMessage(ctx context.Context, message *types.Messa
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d, session ID: %s", tenantID, message.SessionID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, message.SessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), message.SessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return nil, err
@@ -93,7 +108,7 @@ func (s *messageService) GetMessage(ctx context.Context, sessionID string, messa
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d", tenantID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, sessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return nil, err
@@ -122,7 +137,7 @@ func (s *messageService) GetMessagesBySession(ctx context.Context,
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d", tenantID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, sessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return nil, err
@@ -152,11 +167,11 @@ func (s *messageService) GetRecentMessagesBySession(ctx context.Context,
 
 	tenantID, ok := sessionTenantIDForLookup(ctx)
 	if !ok {
-		logger.Error(ctx, "Tenant ID not found in context for session lookup")
-		return nil, errors.New("tenant ID not found in context")
+		logger.Error(ctx, "Workspace ID not found in context for session lookup")
+		return nil, errors.New("workspace ID not found in context")
 	}
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d", tenantID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, sessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return nil, err
@@ -185,11 +200,11 @@ func (s *messageService) GetMessagesBySessionBeforeTime(ctx context.Context,
 
 	tenantID, ok := sessionTenantIDForLookup(ctx)
 	if !ok {
-		logger.Error(ctx, "Tenant ID not found in context for session lookup")
-		return nil, errors.New("tenant ID not found in context")
+		logger.Error(ctx, "Workspace ID not found in context for session lookup")
+		return nil, errors.New("workspace ID not found in context")
 	}
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d", tenantID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, sessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return nil, err
@@ -217,7 +232,7 @@ func (s *messageService) UpdateMessage(ctx context.Context, message *types.Messa
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d", tenantID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, message.SessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), message.SessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return err
@@ -237,6 +252,16 @@ func (s *messageService) UpdateMessage(ctx context.Context, message *types.Messa
 	return nil
 }
 
+// UpdateMessageImages updates only the images JSONB column for a message.
+func (s *messageService) UpdateMessageImages(ctx context.Context, sessionID, messageID string, images types.MessageImages) error {
+	return s.messageRepo.UpdateMessageImages(ctx, sessionID, messageID, images)
+}
+
+// UpdateMessageRenderedContent updates the rendered_content column for a user message.
+func (s *messageService) UpdateMessageRenderedContent(ctx context.Context, sessionID, messageID string, renderedContent string) error {
+	return s.messageRepo.UpdateMessageRenderedContent(ctx, sessionID, messageID, renderedContent)
+}
+
 // DeleteMessage removes a message from a session, also cleaning up its Knowledge entry in the chat history KB.
 func (s *messageService) DeleteMessage(ctx context.Context, sessionID string, messageID string) error {
 	logger.Info(ctx, "Start deleting message")
@@ -244,7 +269,7 @@ func (s *messageService) DeleteMessage(ctx context.Context, sessionID string, me
 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	logger.Infof(ctx, "Checking if session exists, tenant ID: %d", tenantID)
-	_, err := s.sessionRepo.Get(ctx, tenantID, sessionID)
+	_, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to get session: %v", err)
 		return err
@@ -267,6 +292,11 @@ func (s *messageService) DeleteMessage(ctx context.Context, sessionID string, me
 		})
 		return err
 	}
+	if s.suggestionRepo != nil {
+		if err := s.suggestionRepo.DeleteByMessageID(ctx, tenantID, sessionID, messageID); err != nil {
+			logger.Warnf(ctx, "Failed to delete suggestions for message %s: %v", messageID, err)
+		}
+	}
 
 	// Async cleanup: delete the associated Knowledge entry from the chat history KB.
 	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
@@ -276,6 +306,34 @@ func (s *messageService) DeleteMessage(ctx context.Context, sessionID string, me
 	}
 
 	logger.Info(ctx, "Message deleted successfully")
+	return nil
+}
+
+// ClearSessionMessages deletes all messages in a session, along with their chat history KB entries.
+func (s *messageService) ClearSessionMessages(ctx context.Context, sessionID string) error {
+	logger.Infof(ctx, "Start clearing all messages for session: %s", sessionID)
+
+	tenantID := types.MustTenantIDFromContext(ctx)
+	if _, err := s.sessionRepo.Get(ctx, tenantID, sessionUserIDForLookup(ctx), sessionID); err != nil {
+		logger.Errorf(ctx, "Failed to get session: %v", err)
+		return err
+	}
+
+	// Async cleanup: delete associated Knowledge entries from the chat history KB
+	bgCtx := context.WithoutCancel(ctx)
+	go s.DeleteSessionKnowledge(bgCtx, sessionID)
+
+	if err := s.messageRepo.DeleteMessagesBySessionID(ctx, sessionID); err != nil {
+		logger.Errorf(ctx, "Failed to delete messages for session %s: %v", sessionID, err)
+		return err
+	}
+	if s.suggestionRepo != nil {
+		if err := s.suggestionRepo.DeleteBySessionID(ctx, tenantID, sessionID); err != nil {
+			logger.Warnf(ctx, "Failed to delete suggestions for session %s: %v", sessionID, err)
+		}
+	}
+
+	logger.Infof(ctx, "All messages cleared for session: %s", sessionID)
 	return nil
 }
 
@@ -314,7 +372,13 @@ func (s *messageService) getRetrievalConfig(ctx context.Context) *types.Retrieva
 // then links the message to the Knowledge entry via the knowledge_id field.
 // The KB ID is read from the tenant's ChatHistoryConfig — if not configured, indexing is skipped.
 func (s *messageService) IndexMessageToKB(ctx context.Context, userQuery string, assistantAnswer string, messageID string, sessionID string) {
-	if strings.TrimSpace(userQuery) == "" && strings.TrimSpace(assistantAnswer) == "" {
+	// Strip thinking content (<think>...</think>) before indexing to avoid
+	// polluting the knowledge base with intermediate reasoning that would
+	// degrade retrieval quality.
+	assistantAnswer = regThinkIndex.ReplaceAllString(assistantAnswer, "")
+	assistantAnswer = strings.TrimSpace(assistantAnswer)
+
+	if strings.TrimSpace(userQuery) == "" && assistantAnswer == "" {
 		return
 	}
 
@@ -331,7 +395,7 @@ func (s *messageService) IndexMessageToKB(ctx context.Context, userQuery string,
 	passages = append(passages, passage)
 
 	// Use async (non-sync) passage creation so it doesn't block the response
-	knowledge, err := s.knowService.CreateKnowledgeFromPassage(ctx, cfg.KnowledgeBaseID, passages)
+	knowledge, err := s.knowService.CreateKnowledgeFromPassage(ctx, cfg.KnowledgeBaseID, passages, "")
 	if err != nil {
 		logger.Warnf(ctx, "Failed to index message to chat history KB: %v", err)
 		return

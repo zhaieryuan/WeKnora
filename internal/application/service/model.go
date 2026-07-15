@@ -3,15 +3,20 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/asr"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
+	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	"github.com/Tencent/WeKnora/internal/models/vlm"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 // ErrModelNotFound is returned when a model cannot be found in the repository
@@ -20,17 +25,71 @@ var ErrModelNotFound = errors.New("model not found")
 // modelService implements the model service interface
 type modelService struct {
 	repo          interfaces.ModelRepository
+	kbRepo        interfaces.KnowledgeBaseRepository
+	agentRepo     interfaces.CustomAgentRepository
 	ollamaService *ollama.OllamaService
 	pooler        embedding.EmbedderPooler
+	tenantService interfaces.TenantService
 }
 
 // NewModelService creates a new model service instance
-func NewModelService(repo interfaces.ModelRepository, ollamaService *ollama.OllamaService, pooler embedding.EmbedderPooler) interfaces.ModelService {
+func NewModelService(repo interfaces.ModelRepository,
+	kbRepo interfaces.KnowledgeBaseRepository,
+	agentRepo interfaces.CustomAgentRepository,
+	ollamaService *ollama.OllamaService,
+	pooler embedding.EmbedderPooler,
+	tenantService interfaces.TenantService,
+) interfaces.ModelService {
 	return &modelService{
 		repo:          repo,
+		kbRepo:        kbRepo,
+		agentRepo:     agentRepo,
 		ollamaService: ollamaService,
 		pooler:        pooler,
+		tenantService: tenantService,
 	}
+}
+
+// decryptAppSecret 解密 AppSecret（如果为空或 cryptoSvc 为空则原样返回）
+func (s *modelService) decryptAppSecret(encrypted string) string {
+	if encrypted == "" {
+		return encrypted
+	}
+	if key := utils.GetAESKey(); key != nil {
+		if encrypted, err := utils.DecryptAESGCM(encrypted, key); err == nil {
+			return encrypted
+		}
+	}
+	return encrypted
+}
+
+// resolveWeKnoraCloudCredentials 为 WeKnoraCloud 厂商模型补全 AppID/AppSecret。
+// 当模型自身参数中未存储凭证时，自动从空间配置中获取（SaveCredentials 保存的凭证）。
+func (s *modelService) resolveWeKnoraCloudCredentials(ctx context.Context, params *types.ModelParameters) (appID, appSecret string) {
+	appID = params.AppID
+	appSecret = s.decryptAppSecret(params.AppSecret)
+
+	if provider.ProviderName(params.Provider) != provider.ProviderWeKnoraCloud {
+		return
+	}
+	if appID != "" && appSecret != "" {
+		return
+	}
+
+	if s.tenantService == nil {
+		return
+	}
+	creds := s.tenantService.GetWeKnoraCloudCredentials(ctx)
+	if creds == nil {
+		return
+	}
+	if appID == "" {
+		appID = creds.AppID
+	}
+	if appSecret == "" {
+		appSecret = creds.AppSecret
+	}
+	return
 }
 
 // CreateModel creates a new model in the repository
@@ -126,7 +185,6 @@ func (s *modelService) GetModelByID(ctx context.Context, id string) (*types.Mode
 
 	// Check model status
 	if model.Status == types.ModelStatusActive {
-		logger.Info(ctx, "Model is active and ready to use")
 		return model, nil
 	}
 
@@ -169,7 +227,8 @@ func (s *modelService) UpdateModel(ctx context.Context, model *types.Model) erro
 	logger.Info(ctx, "Start updating model")
 	logger.Infof(ctx, "Updating model ID: %s, name: %s", model.ID, model.Name)
 
-	// Check if the model is builtin - builtin models cannot be updated
+	// Built-in models are platform-wide. Tenant administrators may view them,
+	// but only a system administrator may change their shared configuration.
 	tenantID := types.MustTenantIDFromContext(ctx)
 	existingModel, err := s.repo.GetByID(ctx, tenantID, model.ID)
 	if err != nil {
@@ -179,8 +238,15 @@ func (s *modelService) UpdateModel(ctx context.Context, model *types.Model) erro
 		return err
 	}
 	if existingModel != nil && existingModel.IsBuiltin {
-		logger.Warnf(ctx, "Attempted to update builtin model: %s", model.ID)
-		return errors.New("builtin models cannot be updated")
+		if !types.IsSystemAdminFromContext(ctx) {
+			logger.Warnf(ctx, "Non-system-admin attempted to update builtin model: %s", model.ID)
+			return apperrors.NewForbiddenError("only system administrators can update builtin models")
+		}
+		// A UI edit is an explicit runtime override. Clear YAML ownership so
+		// the startup reconciler does not silently replace the saved values.
+		model.TenantID = existingModel.TenantID
+		model.IsBuiltin = true
+		model.ManagedBy = ""
 	}
 
 	// Update model in repository
@@ -194,6 +260,93 @@ func (s *modelService) UpdateModel(ctx context.Context, model *types.Model) erro
 	}
 
 	logger.Infof(ctx, "Model updated successfully: %s", model.ID)
+	return nil
+}
+
+// UpdateModelCredentials writes one or more credential fields on the model's
+// Parameters jsonb. Models are not pooled per-instance the way MCP clients
+// are (each call to GetEmbeddingModel/GetChatModel rebuilds the client from
+// the current Parameters), so no explicit cache invalidation is required —
+// the next call will pick up the new credential automatically.
+func (s *modelService) UpdateModelCredentials(
+	ctx context.Context, id string, apiKey, appSecret *string,
+) (*types.Model, error) {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	existing, err := s.repo.GetByID(ctx, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		return nil, ErrModelNotFound
+	}
+	if existing.IsBuiltin && !types.IsSystemAdminFromContext(ctx) {
+		return nil, apperrors.NewForbiddenError(
+			"only system administrators can modify builtin model credentials")
+	}
+
+	changed := false
+	if apiKey != nil && *apiKey != "" && *apiKey != existing.Parameters.APIKey {
+		existing.Parameters.APIKey = *apiKey
+		changed = true
+	}
+	if appSecret != nil && *appSecret != "" && *appSecret != existing.Parameters.AppSecret {
+		existing.Parameters.AppSecret = *appSecret
+		changed = true
+	}
+	if !changed {
+		return existing, nil
+	}
+	if existing.IsBuiltin {
+		// Credential changes are also runtime overrides of YAML-managed data.
+		existing.ManagedBy = ""
+	}
+	if err := s.repo.Update(ctx, existing); err != nil {
+		return nil, err
+	}
+	logger.Infof(ctx, "Model credentials updated: id=%s", id)
+	return existing, nil
+}
+
+// ClearModelCredential removes a single credential field. Idempotent.
+func (s *modelService) ClearModelCredential(ctx context.Context, id, field string) error {
+	tenantID := types.MustTenantIDFromContext(ctx)
+	existing, err := s.repo.GetByID(ctx, tenantID, id)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return ErrModelNotFound
+	}
+	if existing.IsBuiltin && !types.IsSystemAdminFromContext(ctx) {
+		return apperrors.NewForbiddenError(
+			"only system administrators can modify builtin model credentials")
+	}
+
+	changed := false
+	switch field {
+	case "api_key":
+		if existing.Parameters.APIKey != "" {
+			existing.Parameters.APIKey = ""
+			changed = true
+		}
+	case "app_secret":
+		if existing.Parameters.AppSecret != "" {
+			existing.Parameters.AppSecret = ""
+			changed = true
+		}
+	default:
+		return errors.New("unknown credential field: " + field)
+	}
+	if !changed {
+		return nil
+	}
+	if existing.IsBuiltin {
+		existing.ManagedBy = ""
+	}
+	if err := s.repo.Update(ctx, existing); err != nil {
+		return err
+	}
+	logger.Infof(ctx, "Model credential cleared by user: id=%s field=%s", id, field)
 	return nil
 }
 
@@ -213,9 +366,31 @@ func (s *modelService) DeleteModel(ctx context.Context, id string) error {
 		})
 		return err
 	}
-	if existingModel != nil && existingModel.IsBuiltin {
+	if existingModel == nil {
+		return ErrModelNotFound
+	}
+	if existingModel.IsBuiltin {
 		logger.Warnf(ctx, "Attempted to delete builtin model: %s", id)
-		return errors.New("builtin models cannot be deleted")
+		return apperrors.NewBadRequestError("builtin models cannot be deleted")
+	}
+
+	kbCount, err := s.kbRepo.CountByModelID(ctx, tenantID, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"model_id": id,
+		})
+		return err
+	}
+	agentCount, err := s.agentRepo.CountByModelID(ctx, tenantID, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"model_id": id,
+		})
+		return err
+	}
+	if kbCount > 0 || agentCount > 0 {
+		logger.Warnf(ctx, "Model %s is in use: kb=%d agent=%d", id, kbCount, agentCount)
+		return apperrors.NewBadRequestError(formatModelInUseMessage(kbCount, agentCount))
 	}
 
 	// Delete model from repository
@@ -246,17 +421,9 @@ func (s *modelService) GetEmbeddingModel(ctx context.Context, modelId string) (e
 
 	logger.Infof(ctx, "Getting embedding model: %s, source: %s", model.Name, model.Source)
 
-	// Initialize the embedder with model configuration
-	embedder, err := embedding.NewEmbedder(embedding.Config{
-		Source:               model.Source,
-		BaseURL:              model.Parameters.BaseURL,
-		APIKey:               model.Parameters.APIKey,
-		ModelID:              model.ID,
-		ModelName:            model.Name,
-		Dimensions:           model.Parameters.EmbeddingParameters.Dimension,
-		TruncatePromptTokens: model.Parameters.EmbeddingParameters.TruncatePromptTokens,
-		Provider:             model.Parameters.Provider,
-	}, s.pooler, s.ollamaService)
+	appID, appSecret := s.resolveWeKnoraCloudCredentials(ctx, &model.Parameters)
+
+	embedder, err := embedding.NewEmbedder(embedding.ConfigFromModel(model, appID, appSecret), s.pooler, s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"model_id":   model.ID,
@@ -301,17 +468,9 @@ func (s *modelService) GetEmbeddingModelForTenant(ctx context.Context, modelId s
 
 	logger.Infof(ctx, "Getting cross-tenant embedding model: %s, source: %s, tenant: %d", model.Name, model.Source, tenantID)
 
-	// Initialize the embedder with model configuration
-	embedder, err := embedding.NewEmbedder(embedding.Config{
-		Source:               model.Source,
-		BaseURL:              model.Parameters.BaseURL,
-		APIKey:               model.Parameters.APIKey,
-		ModelID:              model.ID,
-		ModelName:            model.Name,
-		Dimensions:           model.Parameters.EmbeddingParameters.Dimension,
-		TruncatePromptTokens: model.Parameters.EmbeddingParameters.TruncatePromptTokens,
-		Provider:             model.Parameters.Provider,
-	}, s.pooler, s.ollamaService)
+	appID, appSecret := s.resolveWeKnoraCloudCredentials(ctx, &model.Parameters)
+
+	embedder, err := embedding.NewEmbedder(embedding.ConfigFromModel(model, appID, appSecret), s.pooler, s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"model_id":   model.ID,
@@ -339,14 +498,9 @@ func (s *modelService) GetRerankModel(ctx context.Context, modelId string) (rera
 
 	logger.Infof(ctx, "Getting rerank model: %s, source: %s", model.Name, model.Source)
 
-	// Initialize the reranker with model configuration
-	reranker, err := rerank.NewReranker(&rerank.RerankerConfig{
-		ModelID:   model.ID,
-		APIKey:    model.Parameters.APIKey,
-		BaseURL:   model.Parameters.BaseURL,
-		ModelName: model.Name,
-		Source:    model.Source,
-	})
+	appID, appSecret := s.resolveWeKnoraCloudCredentials(ctx, &model.Parameters)
+
+	reranker, err := rerank.NewReranker(rerank.ConfigFromModel(model, appID, appSecret))
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"model_id":   model.ID,
@@ -387,14 +541,9 @@ func (s *modelService) GetChatModel(ctx context.Context, modelId string) (chat.C
 
 	logger.Infof(ctx, "Getting chat model: %s, source: %s", model.Name, model.Source)
 
-	// Initialize the chat model with model configuration
-	chatModel, err := chat.NewChat(&chat.ChatConfig{
-		ModelID:   model.ID,
-		APIKey:    model.Parameters.APIKey,
-		BaseURL:   model.Parameters.BaseURL,
-		ModelName: model.Name,
-		Source:    model.Source,
-	}, s.ollamaService)
+	appID, appSecret := s.resolveWeKnoraCloudCredentials(ctx, &model.Parameters)
+
+	chatModel, err := chat.NewChat(chat.ConfigFromModel(model, appID, appSecret), s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"model_id":   model.ID,
@@ -429,23 +578,9 @@ func (s *modelService) GetVLMModel(ctx context.Context, modelId string) (vlm.VLM
 
 	logger.Infof(ctx, "Getting VLM model: %s, source: %s", model.Name, model.Source)
 
-	ifType := model.Parameters.InterfaceType
-	if ifType == "" {
-		if model.Source == types.ModelSourceLocal {
-			ifType = "ollama"
-		} else {
-			ifType = "openai"
-		}
-	}
+	appID, appSecret := s.resolveWeKnoraCloudCredentials(ctx, &model.Parameters)
 
-	vlmModel, err := vlm.NewVLM(&vlm.Config{
-		ModelID:       model.ID,
-		APIKey:        model.Parameters.APIKey,
-		BaseURL:       model.Parameters.BaseURL,
-		ModelName:     model.Name,
-		Source:        model.Source,
-		InterfaceType: ifType,
-	}, s.ollamaService)
+	vlmModel, err := vlm.NewVLM(vlm.ConfigFromModel(model, appID, appSecret), s.ollamaService)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"model_id":   model.ID,
@@ -459,3 +594,61 @@ func (s *modelService) GetVLMModel(ctx context.Context, modelId string) (vlm.VLM
 
 // Note: default model selection logic has been removed; models no longer
 // maintain a per-type default flag at the service layer.
+
+// GetASRModel retrieves and initializes an automatic speech recognition model instance.
+func (s *modelService) GetASRModel(ctx context.Context, modelId string) (asr.ASR, error) {
+	if modelId == "" {
+		return nil, errors.New("model ID cannot be empty")
+	}
+
+	tenantID := types.MustTenantIDFromContext(ctx)
+
+	model, err := s.repo.GetByID(ctx, tenantID, modelId)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"model_id":  modelId,
+			"tenant_id": tenantID,
+		})
+		return nil, err
+	}
+
+	if model == nil {
+		return nil, ErrModelNotFound
+	}
+
+	logger.Infof(ctx, "Getting ASR model: %s, source: %s", model.Name, model.Source)
+
+	sttModel, err := asr.NewASR(asr.ConfigFromModel(model))
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"model_id":   model.ID,
+			"model_name": model.Name,
+		})
+		return nil, err
+	}
+
+	return sttModel, nil
+}
+
+func formatModelInUseMessage(kbCount, agentCount int64) string {
+	switch {
+	case kbCount > 0 && agentCount > 0:
+		return fmt.Sprintf(
+			"model is used by %d knowledge base(s) and %d agent(s); "+
+				"reconfigure or remove those references before deleting",
+			kbCount, agentCount,
+		)
+	case kbCount > 0:
+		return fmt.Sprintf(
+			"model is used by %d knowledge base(s); "+
+				"reconfigure or remove those references before deleting",
+			kbCount,
+		)
+	default:
+		return fmt.Sprintf(
+			"model is used by %d agent(s); "+
+				"reconfigure or remove those references before deleting",
+			agentCount,
+		)
+	}
+}

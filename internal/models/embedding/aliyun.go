@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 const (
@@ -20,22 +21,39 @@ const (
 
 // AliyunEmbedder implements text vectorization using Aliyun DashScope multimodal embedding API
 type AliyunEmbedder struct {
-	apiKey               string
-	baseURL              string
-	modelName            string
-	truncatePromptTokens int
-	dimensions           int
-	modelID              string
-	httpClient           *http.Client
-	timeout              time.Duration
-	maxRetries           int
+	apiKey                    string
+	baseURL                   string
+	modelName                 string
+	truncatePromptTokens      int
+	dimensions                int
+	modelID                   string
+	httpClient                *http.Client
+	timeout                   time.Duration
+	maxRetries                int
+	customHeaders             map[string]string
+	supportsDimensionOverride bool
 	EmbedderPooler
+}
+
+// SetCustomHeaders 设置用户自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
+func (e *AliyunEmbedder) SetCustomHeaders(headers map[string]string) {
+	e.customHeaders = headers
+}
+
+func (e *AliyunEmbedder) SetSupportsDimensionOverride(supported bool) {
+	e.supportsDimensionOverride = supported
+}
+
+// AliyunEmbedParameters represents the parameters for Aliyun DashScope multimodal embedding
+type AliyunEmbedParameters struct {
+	Dimension int `json:"dimension,omitempty"`
 }
 
 // AliyunEmbedRequest represents an Aliyun DashScope multimodal embedding request
 type AliyunEmbedRequest struct {
-	Model string           `json:"model"`
-	Input AliyunEmbedInput `json:"input"`
+	Model      string                 `json:"model"`
+	Input      AliyunEmbedInput       `json:"input"`
+	Parameters *AliyunEmbedParameters `json:"parameters,omitempty"`
 }
 
 // AliyunEmbedInput represents the input structure for Aliyun embedding
@@ -94,15 +112,15 @@ func NewAliyunEmbedder(apiKey, baseURL, modelName string,
 
 	timeout := 60 * time.Second
 
-	client := &http.Client{
-		Timeout: timeout,
+	if err := validateEmbeddingBaseURL(baseURL); err != nil {
+		return nil, err
 	}
 
 	return &AliyunEmbedder{
 		apiKey:               apiKey,
 		baseURL:              baseURL,
 		modelName:            modelName,
-		httpClient:           client,
+		httpClient:           newEmbeddingHTTPClient(timeout),
 		truncatePromptTokens: truncatePromptTokens,
 		EmbedderPooler:       pooler,
 		dimensions:           dimensions,
@@ -154,6 +172,7 @@ func (e *AliyunEmbedder) doRequestWithRetry(ctx context.Context, jsonData []byte
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+e.apiKey)
+		secutils.ApplyCustomHeaders(req, e.customHeaders)
 
 		resp, err = e.httpClient.Do(req)
 		if err == nil {
@@ -179,6 +198,9 @@ func (e *AliyunEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 		Input: AliyunEmbedInput{
 			Contents: contents,
 		},
+	}
+	if e.supportsDimensionsParam() {
+		reqBody.Parameters = &AliyunEmbedParameters{Dimension: e.dimensions}
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -234,6 +256,10 @@ func (e *AliyunEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 // GetModelName returns the model name
 func (e *AliyunEmbedder) GetModelName() string {
 	return e.modelName
+}
+
+func (e *AliyunEmbedder) supportsDimensionsParam() bool {
+	return e.supportsDimensionOverride && e.dimensions > 0
 }
 
 // GetDimensions returns the vector dimensions

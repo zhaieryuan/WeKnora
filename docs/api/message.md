@@ -20,7 +20,7 @@
 
 ```curl
 curl --location --request GET 'http://localhost:8080/api/v1/messages/ceb9babb-1e30-41d7-817d-fd584954304b/load?limit=3&before_time=2030-08-12T14%3A35%3A42.123456789Z' \
---header 'X-API-Key: sk-vQHV2NZI_LK5W7wHQvH3yGYExX8YnhaHwZipUYbiZKCYJbBQ' \
+--header 'X-API-Key: sk-xxxxx' \
 --header 'Content-Type: application/json' \
 --data '{
     "query": "彗尾的形状"
@@ -84,6 +84,9 @@ curl --location --request GET 'http://localhost:8080/api/v1/messages/ceb9babb-1e
             ],
             "agent_steps": [],
             "is_completed": true,
+            "is_fallback": false,
+            "agent_duration_ms": 2500,
+            "channel": "web",
             "created_at": "2025-08-12T10:24:38.370548+08:00",
             "updated_at": "2025-08-12T10:25:40.416382+08:00",
             "deleted_at": null
@@ -97,6 +100,9 @@ curl --location --request GET 'http://localhost:8080/api/v1/messages/ceb9babb-1e
             "knowledge_references": [],
             "agent_steps": [],
             "is_completed": true,
+            "mentioned_items": [],
+            "images": [],
+            "channel": "web",
             "created_at": "2025-08-12T14:30:39.732246+08:00",
             "updated_at": "2025-08-12T14:30:39.733277+08:00",
             "deleted_at": null
@@ -153,6 +159,9 @@ curl --location --request GET 'http://localhost:8080/api/v1/messages/ceb9babb-1e
             ],
             "agent_steps": [],
             "is_completed": true,
+            "is_fallback": false,
+            "agent_duration_ms": 2500,
+            "channel": "web",
             "created_at": "2025-08-12T14:30:39.735108+08:00",
             "updated_at": "2025-08-12T14:31:17.829926+08:00",
             "deleted_at": null
@@ -168,7 +177,7 @@ curl --location --request GET 'http://localhost:8080/api/v1/messages/ceb9babb-1e
 
 ```curl
 curl --location --request DELETE 'http://localhost:8080/api/v1/messages/ceb9babb-1e30-41d7-817d-fd584954304b/9bcafbcf-a758-40af-a9a3-c4d8e0f49439' \
---header 'X-API-Key: sk-vQHV2NZI_LK5W7wHQvH3yGYExX8YnhaHwZipUYbiZKCYJbBQ' \
+--header 'X-API-Key: sk-xxxxx' \
 --header 'Content-Type: application/json'
 ```
 
@@ -195,7 +204,7 @@ curl --location --request DELETE 'http://localhost:8080/api/v1/messages/ceb9babb
 
 ```curl
 curl --location 'http://localhost:8080/api/v1/messages/search' \
---header 'X-API-Key: sk-vQHV2NZI_LK5W7wHQvH3yGYExX8YnhaHwZipUYbiZKCYJbBQ' \
+--header 'X-API-Key: sk-xxxxx' \
 --header 'Content-Type: application/json' \
 --data '{
     "query": "彗星的结构",
@@ -230,13 +239,13 @@ curl --location 'http://localhost:8080/api/v1/messages/search' \
 
 ## GET `/messages/chat-history-stats` - 获取聊天历史知识库统计
 
-获取当前租户的聊天历史知识库索引统计信息。
+获取当前空间的聊天历史知识库索引统计信息。
 
 **请求**:
 
 ```curl
 curl --location 'http://localhost:8080/api/v1/messages/chat-history-stats' \
---header 'X-API-Key: sk-vQHV2NZI_LK5W7wHQvH3yGYExX8YnhaHwZipUYbiZKCYJbBQ' \
+--header 'X-API-Key: sk-xxxxx' \
 --header 'Content-Type: application/json'
 ```
 

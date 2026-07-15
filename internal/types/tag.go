@@ -1,6 +1,10 @@
 package types
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // KnowledgeTag represents a tag (category) under a specific knowledge base.
 // Tags are scoped by knowledge base (and tenant) and are used to categorize
@@ -10,7 +14,7 @@ type KnowledgeTag struct {
 	ID string `json:"id"                gorm:"type:varchar(36);primaryKey"`
 	// SeqID is an auto-increment integer ID for external API usage
 	SeqID int64 `json:"seq_id"            gorm:"type:bigint;uniqueIndex;autoIncrement"`
-	// Tenant ID
+	// Workspace ID
 	TenantID uint64 `json:"tenant_id"`
 	// Knowledge base ID that this tag belongs to
 	KnowledgeBaseID string `json:"knowledge_base_id" gorm:"type:varchar(36);index"`
@@ -26,6 +30,28 @@ type KnowledgeTag struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// BeforeCreate ensures SeqID is populated for databases that don't support
+// autoIncrement on non-primary-key columns (e.g. SQLite).
+// On PostgreSQL/MySQL the DB sequence handles this, so we skip to avoid
+// duplicate key races under concurrent inserts.
+func (t *KnowledgeTag) BeforeCreate(tx *gorm.DB) error {
+	if tx.Dialector.Name() != "sqlite" {
+		return nil
+	}
+	if t.SeqID == 0 {
+		var maxSeqID *int64
+		tx.Unscoped().Model(&KnowledgeTag{}).
+			Select("MAX(seq_id)").
+			Scan(&maxSeqID)
+		if maxSeqID != nil {
+			t.SeqID = *maxSeqID + 1
+		} else {
+			t.SeqID = 1
+		}
+	}
+	return nil
+}
+
 // KnowledgeTagWithStats represents tag information along with usage statistics.
 type KnowledgeTagWithStats struct {
 	KnowledgeTag
@@ -37,4 +63,17 @@ type KnowledgeTagWithStats struct {
 type TagReferenceCounts struct {
 	KnowledgeCount int64
 	ChunkCount     int64
+}
+
+// KnowledgeTagRelation represents a many-to-many association between
+// a document knowledge entry and a tag in the knowledge_tag_relations table.
+type KnowledgeTagRelation struct {
+	KnowledgeID string    `gorm:"type:varchar(36);primaryKey"`
+	TagID       string    `gorm:"type:varchar(36);primaryKey"`
+	CreatedAt   time.Time `gorm:"autoCreateTime"`
+}
+
+// TableName overrides the default table name.
+func (KnowledgeTagRelation) TableName() string {
+	return "knowledge_tag_relations"
 }

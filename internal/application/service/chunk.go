@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
@@ -21,6 +22,7 @@ type chunkService struct {
 	kbRepository    interfaces.KnowledgeBaseRepository
 	modelService    interfaces.ModelService
 	retrieveEngine  interfaces.RetrieveEngineRegistry
+	ownership       retriever.TenantStoreOwnership
 }
 
 // NewChunkService creates a new chunk service
@@ -35,12 +37,14 @@ func NewChunkService(
 	kbRepository interfaces.KnowledgeBaseRepository,
 	modelService interfaces.ModelService,
 	retrieveEngine interfaces.RetrieveEngineRegistry,
+	ownership retriever.TenantStoreOwnership,
 ) interfaces.ChunkService {
 	return &chunkService{
 		chunkRepository: chunkRepository,
 		kbRepository:    kbRepository,
 		modelService:    modelService,
 		retrieveEngine:  retrieveEngine,
+		ownership:       ownership,
 	}
 }
 
@@ -104,7 +108,9 @@ func (s *chunkService) GetChunkByID(ctx context.Context, id string) (*types.Chun
 func (s *chunkService) GetChunkByIDOnly(ctx context.Context, id string) (*types.Chunk, error) {
 	chunk, err := s.chunkRepository.GetChunkByIDOnly(ctx, id)
 	if err != nil {
-		if err != nil && err.Error() == "chunk not found" {
+		// errors.Is (not string equality) so the sentinel survives wrapping.
+		// ErrChunkNotFound aliases the repo sentinel, so this matches directly.
+		if errors.Is(err, ErrChunkNotFound) {
 			return nil, ErrChunkNotFound
 		}
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{"chunk_id": id})
@@ -404,8 +410,8 @@ func (s *chunkService) DeleteGeneratedQuestion(ctx context.Context, chunkID stri
 	// The source_id format is: {chunk_id}-{question_id}
 	sourceID := fmt.Sprintf("%s-%s", chunkID, questionID)
 
-	tenantInfo, _ := types.TenantInfoFromContext(ctx)
-	retrieveEngine, err := retriever.NewCompositeRetrieveEngine(s.retrieveEngine, tenantInfo.GetEffectiveEngines())
+	retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
+		ctx, s.retrieveEngine, s.ownership, tenantID, kb.VectorStoreID)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"chunk_id": chunkID,

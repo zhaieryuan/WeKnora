@@ -68,8 +68,9 @@ def parse_arguments():
   python main.py --verbose          # 启用详细日志
   
 环境变量:
-  WEKNORA_BASE_URL    WeKnora API 基础 URL (默认: http://localhost:8080/api/v1)
-  WEKNORA_API_KEY     WeKnora API 密钥
+  WEKNORA_BASE_URL       WeKnora API 基础 URL (默认: http://localhost:8080/api/v1)
+  WEKNORA_API_KEY        WeKnora API 密钥
+  MCP_SERVER_AUTH_TOKEN  SSE/HTTP 传输必填，客户端通过 Authorization: Bearer 传递
         """,
     )
 
@@ -81,6 +82,24 @@ def parse_arguments():
 
     parser.add_argument(
         "--version", action="version", version="WeKnora MCP Server 1.0.0"
+    )
+
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "http"],
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="Transport type: stdio (default), sse, or http",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "127.0.0.1"),
+        help="Bind host for network transports (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_PORT", "8000")),
+        help="Bind port for network transports (default: 8000)",
     )
 
     return parser.parse_args()
@@ -113,12 +132,23 @@ async def main():
         print("已启用详细日志模式")
 
     try:
-        print("正在启动 WeKnora MCP Server...")
+        print(f"正在启动 WeKnora MCP Server (transport={args.transport})...")
 
-        # 导入并运行服务器
-        from weknora_mcp_server import run
+        from weknora_mcp_server import run_stdio, run_sse, run_http
 
-        await run()
+        # Select transport mode based on CLI argument or MCP_TRANSPORT env var
+        # - stdio: Default, used by VS Code Copilot for local integration
+        # - sse: Server-Sent Events over HTTP, suitable for cloud/remote deployments
+        # - http: Streamable HTTP sessions (MCP 2025-03-26 spec), compatible with REST clients
+        if args.transport == "stdio":
+            # Stdio mode: communication via stdin/stdout pipes (typical for CLI integrations)
+            await run_stdio()
+        elif args.transport == "sse":
+            # SSE mode: HTTP server with Server-Sent Events for bidirectional streaming
+            await run_sse(args.host, args.port)
+        elif args.transport == "http":
+            # HTTP mode: HTTP REST server with request/response model
+            await run_http(args.host, args.port)
 
     except ImportError as e:
         print(f"导入错误: {e}")

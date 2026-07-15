@@ -19,13 +19,12 @@
             </div>
         </div>
         <div class="think-content" v-show="!isFold || deepSession.thinking">
-            <div ref="contentInnerRef" class="content-inner" v-html="safeProcessThinkContent(deepSession.thinkContent)"></div>
+            <div ref="contentInnerRef" class="content-inner">{{ deepSession.thinkContent }}</div>
         </div>
     </div>
 </template>
 <script setup>
-import { watch, ref, defineProps, onMounted, nextTick } from 'vue';
-import { sanitizeHTML } from '@/utils/security';
+import { watch, ref, onMounted, nextTick } from 'vue';
 import { useI18n } from 'vue-i18n';
 
 const isFold = ref(false)
@@ -79,19 +78,6 @@ const toggleFold = () => {
         isFold.value = !isFold.value;
     }
 }
-
-// 安全地处理思考内容，防止XSS攻击
-const safeProcessThinkContent = (content) => {
-    if (!content || typeof content !== 'string') return '';
-
-    // 先处理换行符
-    const contentWithBreaks = content.replace(/\n/g, '<br/>');
-
-    // 使用DOMPurify进行安全清理，允许基本的文本格式化标签
-    const cleanContent = sanitizeHTML(contentWithBreaks);
-
-    return cleanContent;
-};
 </script>
 <style lang="less" scoped>
 .deep-think {
@@ -102,7 +88,7 @@ const safeProcessThinkContent = (content) => {
     border-radius: 8px;
     background-color: var(--td-bg-color-container);
     border: .5px solid var(--td-component-stroke);
-    box-shadow: 0 2px 4px rgba(7, 192, 95, 0.08);
+    box-shadow: 0 2px 4px color-mix(in srgb, var(--td-brand-color) 8%, transparent);
     overflow: hidden;
     box-sizing: border-box;
     transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
@@ -119,7 +105,7 @@ const safeProcessThinkContent = (content) => {
         user-select: none;
 
         &:hover {
-            background-color: rgba(7, 192, 95, 0.04);
+            background-color: color-mix(in srgb, var(--td-brand-color) 4%, transparent);
         }
 
         .think-title {
@@ -204,6 +190,7 @@ const safeProcessThinkContent = (content) => {
             max-height: 200px;
             overflow-y: auto;
             word-break: break-word;
+            white-space: pre-wrap;
 
             &::-webkit-scrollbar {
                 width: 4px;

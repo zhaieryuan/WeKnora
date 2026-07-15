@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
@@ -166,11 +167,15 @@ func (s *tosFileService) SaveFile(ctx context.Context, file *multipart.FileHeade
 	}
 	defer src.Close()
 
+	contentType := file.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = utils.GetContentTypeByExt(ext)
+	}
 	_, err = s.client.PutObjectV2(ctx, &tos.PutObjectV2Input{
 		PutObjectBasicInput: tos.PutObjectBasicInput{
 			Bucket:      s.bucketName,
 			Key:         objectName,
-			ContentType: file.Header.Get("Content-Type"),
+			ContentType: contentType,
 		},
 		Content: src,
 	})
@@ -210,7 +215,7 @@ func (s *tosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 		PutObjectBasicInput: tos.PutObjectBasicInput{
 			Bucket:      targetBucket,
 			Key:         objectName,
-			ContentType: "text/csv; charset=utf-8",
+			ContentType: utils.GetContentTypeByExt(ext),
 		},
 		Content: reader,
 	})
@@ -219,6 +224,43 @@ func (s *tosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	}
 
 	return fmt.Sprintf("tos://%s/%s", targetBucket, objectName), nil
+}
+
+// CopyFile copies an existing TOS object to a new knowledge-owned object using a
+// server-side CopyObject (no data leaves TOS). The destination uses the same
+// layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not a tos:// path.
+func (s *tosFileService) CopyFile(ctx context.Context,
+	srcPath string, tenantID uint64, knowledgeID string,
+) (string, error) {
+	srcBucket, srcKey, err := parseTOSFilePath(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("tos copy rejected source %q: %w", srcPath, ErrCrossBackendCopy)
+	}
+	if err := utils.SafeObjectKey(srcKey); err != nil {
+		return "", fmt.Errorf("invalid source path: %w", err)
+	}
+
+	ext := filepath.Ext(srcPath)
+	destKey := joinTOSObjectKey(
+		s.pathPrefix,
+		fmt.Sprintf("%d", tenantID),
+		knowledgeID,
+		uuid.New().String()+ext,
+	)
+
+	_, err = s.client.CopyObject(ctx, &tos.CopyObjectInput{
+		Bucket:    s.bucketName,
+		Key:       destKey,
+		SrcBucket: srcBucket,
+		SrcKey:    srcKey,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to copy file in TOS: %w", err)
+	}
+
+	newPath := fmt.Sprintf("tos://%s/%s", s.bucketName, destKey)
+	logger.Infof(ctx, "Copied TOS object %s to %s", srcPath, newPath)
+	return newPath, nil
 }
 
 func (s *tosFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {

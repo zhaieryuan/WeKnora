@@ -4,7 +4,7 @@
     <div v-if="documents.length" class="documents-list">
       <div
         v-for="(doc, index) in documents"
-        :key="doc.knowledge_id || index"
+        :key="doc.faq_id || doc.knowledge_id || index"
         class="result-card document-card"
       >
         <div class="result-header document-header">
@@ -20,9 +20,22 @@
         </div>
         <div class="result-content expanded">
           <div class="info-section">
-            <div class="info-field">
-              <span class="field-label">{{ $t('chat.documentIdLabel') }}</span>
+            <div class="info-field" v-if="doc.is_faq && doc.faq_id">
+              <span class="field-label">{{ $t('chat.faqIdLabel') }}</span>
+              <span class="field-value"><code>{{ doc.faq_id }}</code></span>
+            </div>
+            <div class="info-field" v-if="doc.knowledge_id">
+              <span class="field-label">{{ doc.is_faq ? $t('chat.faqContainerIdLabel') : $t('chat.documentIdLabel') }}</span>
               <span class="field-value"><code>{{ doc.knowledge_id }}</code></span>
+            </div>
+            <div
+              v-if="doc.is_faq && doc.faq_answers?.length"
+              class="info-field info-field--block"
+            >
+              <span class="field-label">{{ $t('chat.faqAnswersLabel') }}</span>
+              <ul class="faq-answers-list">
+                <li v-for="(ans, aIdx) in doc.faq_answers" :key="aIdx">{{ ans }}</li>
+              </ul>
             </div>
             <div class="info-field" v-if="doc.description">
               <span class="field-label">{{ $t('chat.documentDescriptionLabel') }}</span>
@@ -31,6 +44,10 @@
             <div class="info-field" v-if="doc.source || doc.type">
               <span class="field-label">{{ $t('chat.documentSourceLabel') }}</span>
               <span class="field-value">{{ formatSource(doc) }}</span>
+            </div>
+            <div class="info-field" v-if="doc.channel && doc.channel !== 'web'">
+              <span class="field-label">{{ $t('knowledgeBase.channelLabel') }}</span>
+              <span class="field-value">{{ getChannelLabel(doc.channel) }}</span>
             </div>
             <div class="info-field" v-if="doc.file_name || doc.file_type || doc.file_size">
               <span class="field-label">{{ $t('chat.documentFileLabel') }}</span>
@@ -68,7 +85,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineProps } from 'vue';
+import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import type { DocumentInfoData, DocumentInfoDocument } from '@/types/tool-results';
 
@@ -83,6 +100,23 @@ const errors = computed(() => props.data?.errors?.filter(Boolean) ?? []);
 const totalChunkCount = computed(() =>
   documents.value.reduce((sum, doc) => sum + (doc.chunk_count || 0), 0),
 );
+
+const channelLabelMap: Record<string, string> = {
+  web: 'knowledgeBase.channelWeb',
+  api: 'knowledgeBase.channelApi',
+  browser_extension: 'knowledgeBase.channelBrowserExtension',
+  wechat: 'knowledgeBase.channelWechat',
+  wecom: 'knowledgeBase.channelWecom',
+  feishu: 'knowledgeBase.channelFeishu',
+  dingtalk: 'knowledgeBase.channelDingtalk',
+  slack: 'knowledgeBase.channelSlack',
+  im: 'knowledgeBase.channelIm',
+};
+
+const getChannelLabel = (channel: string) => {
+  const key = channelLabelMap[channel];
+  return key ? t(key) : t('knowledgeBase.channelUnknown');
+};
 
 const formatSource = (doc: DocumentInfoDocument) => {
   if (doc.type && doc.source) {
@@ -184,12 +218,32 @@ const formatMetadataValue = (value: unknown) => {
   }
 }
 
+.faq-answers-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  li {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--td-text-color-primary);
+  }
+}
+
 .info-field {
   display: flex;
   gap: 10px;
   margin-bottom: 5px;
   font-size: 12px;
   line-height: 1.5;
+
+  &--block {
+    flex-direction: column;
+    gap: 4px;
+  }
 
   .field-label {
     color: var(--td-text-color-secondary);
@@ -230,7 +284,7 @@ const formatMetadataValue = (value: unknown) => {
   }
 
   .metadata-value {
-    font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+    font-family: var(--app-font-family-mono);
     color: var(--td-text-color-primary);
   }
 }
@@ -246,7 +300,7 @@ const formatMetadataValue = (value: unknown) => {
 }
 
 code {
-  font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+  font-family: var(--app-font-family-mono);
   font-size: 10px;
   background: var(--td-bg-color-secondarycontainer);
   padding: 2px 4px;

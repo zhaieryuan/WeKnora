@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // ContinueStream godoc
@@ -27,7 +29,7 @@ import (
 // @Failure      404         {object}  errors.AppError         "会话或消息不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
-// @Router       /sessions/{session_id}/continue [get]
+// @Router       /sessions/continue-stream/{session_id} [get]
 func (h *Handler) ContinueStream(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -54,7 +56,7 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 	// Verify that the session exists and belongs to this tenant
 	_, err := h.sessionService.GetSession(ctx, sessionID)
 	if err != nil {
-		if err == errors.ErrSessionNotFound {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
 			logger.Warnf(ctx, "Session not found, ID: %s", sessionID)
 			c.Error(errors.NewNotFoundError(err.Error()))
 		} else {
@@ -67,6 +69,25 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 	// Get the incomplete message
 	message, err := h.messageService.GetMessage(ctx, sessionID, messageID)
 	if err != nil {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
+			// PR #1309 plumbed user-scope into messageService.GetMessage's
+			// session existence check; non-owner / wrong-user lookups now
+			// surface as ErrSessionNotFound. Map to 404 so clients can tell
+			// "wrong URL" from a real 5xx instead of seeing a generic 500.
+			logger.Warnf(ctx, "Session not found, ID: %s", sessionID)
+			c.Error(errors.NewNotFoundError(err.Error()))
+			return
+		}
+		if stderrors.Is(err, gorm.ErrRecordNotFound) {
+			// The message_id doesn't exist (e.g. a wrong / non-persisted id, or an
+			// expired replay buffer). That is a client error, not a server fault:
+			// return 404 so callers read resource.not_found (a permanent condition
+			// they must not retry) instead of a retryable 5xx. Mirrors the
+			// ErrSessionNotFound branch above and the kb/doc/chunk not-found fix.
+			logger.Warnf(ctx, "Message not found, session ID: %s, message ID: %s", sessionID, messageID)
+			c.Error(errors.NewNotFoundError(err.Error()))
+			return
+		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return

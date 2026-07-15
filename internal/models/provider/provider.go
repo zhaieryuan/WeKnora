@@ -15,12 +15,16 @@ type ProviderName string
 const (
 	// OpenAI
 	ProviderOpenAI ProviderName = "openai"
+	// Anthropic Claude
+	ProviderAnthropic ProviderName = "anthropic"
 	// 阿里云 DashScope
 	ProviderAliyun ProviderName = "aliyun"
 	// 智谱AI (GLM 系列)
 	ProviderZhipu ProviderName = "zhipu"
 	// OpenRouter
 	ProviderOpenRouter ProviderName = "openrouter"
+	// Requesty
+	ProviderRequesty ProviderName = "requesty"
 	// 硅基流动
 	ProviderSiliconFlow ProviderName = "siliconflow"
 	// Jina AI (Embedding and Rerank)
@@ -53,12 +57,19 @@ const (
 	ProviderLongCat ProviderName = "longcat"
 	// 腾讯云 LKEAP (知识引擎原子能力)
 	ProviderLKEAP ProviderName = "lkeap"
+	// NVIDIA
+	ProviderNvidia ProviderName = "nvidia"
+	// Novita AI
+	ProviderNovita ProviderName = "novita"
+	// Azure OpenAI
+	ProviderAzureOpenAI ProviderName = "azure_openai"
 )
 
 // AllProviders 返回所有注册的提供者名称
 func AllProviders() []ProviderName {
 	return []ProviderName{
 		ProviderGeneric,
+		ProviderWeKnoraCloud,
 		ProviderAliyun,
 		ProviderZhipu,
 		ProviderVolcengine,
@@ -71,13 +82,18 @@ func AllProviders() []ProviderName {
 		ProviderQianfan,
 		ProviderQiniu,
 		ProviderOpenAI,
+		ProviderAnthropic,
 		ProviderGemini,
 		ProviderOpenRouter,
+		ProviderRequesty,
 		ProviderJina,
 		ProviderMimo,
 		ProviderLongCat,
 		ProviderLKEAP,
 		ProviderGPUStack,
+		ProviderNvidia,
+		ProviderNovita,
+		ProviderAzureOpenAI,
 	}
 }
 
@@ -211,12 +227,18 @@ func DetectProvider(baseURL string) ProviderName {
 		return ProviderZhipu
 	case containsAny(baseURL, "openrouter.ai"):
 		return ProviderOpenRouter
+	case containsAny(baseURL, "router.requesty.ai", "requesty.ai"):
+		return ProviderRequesty
 	case containsAny(baseURL, "siliconflow.cn"):
 		return ProviderSiliconFlow
 	case containsAny(baseURL, "api.jina.ai"):
 		return ProviderJina
+	case containsAny(baseURL, "openai.azure.com"):
+		return ProviderAzureOpenAI
 	case containsAny(baseURL, "api.openai.com"):
 		return ProviderOpenAI
+	case containsAny(baseURL, "api.anthropic.com"):
+		return ProviderAnthropic
 	case containsAny(baseURL, "api.deepseek.com"):
 		return ProviderDeepSeek
 	case containsAny(baseURL, "generativelanguage.googleapis.com"):
@@ -241,8 +263,14 @@ func DetectProvider(baseURL string) ProviderName {
 		return ProviderQianfan
 	case containsAny(baseURL, "longcat.chat"):
 		return ProviderLongCat
-	case containsAny(baseURL, "lkeap.cloud.tencent.com", "api.lkeap"):
+	case containsAny(baseURL, "lkeap.cloud.tencent.com", "api.lkeap", "lkeap.tencentcloudapi.com"):
 		return ProviderLKEAP
+	case containsAny(baseURL, "nvidia.com"):
+		return ProviderNvidia
+	case containsAny(baseURL, "api.novita.ai", "novita.ai"):
+		return ProviderNovita
+	case containsAny(baseURL, "weknora.weixin.qq.com"):
+		return ProviderWeKnoraCloud
 	default:
 		return ProviderGeneric
 	}

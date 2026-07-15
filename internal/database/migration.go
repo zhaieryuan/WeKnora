@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -10,29 +11,71 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/database/sqlite3"
+	sqlite3migrate "github.com/golang-migrate/migrate/v4/database/sqlite3"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
 var (
+	migrationStateMu        sync.RWMutex
 	currentMigrationVersion uint
 	currentMigrationDirty   bool
-	migrationVersionOnce    sync.Once
 	migrationVersionSet     bool
+	currentMigrationError   string
 )
 
 // CachedMigrationVersion returns the migration version captured at startup.
 // Returns (version, dirty, ok). ok is false if the version was never captured.
+//
+// Note: when migrations fail mid-way, the cache may still be populated via a
+// best-effort m.Version() call inside RunMigrationsWithOptions so the system
+// info endpoint can surface the partial state. Check CachedMigrationError() to
+// distinguish a clean version reading from a recorded-after-failure one.
 func CachedMigrationVersion() (uint, bool, bool) {
+	migrationStateMu.RLock()
+	defer migrationStateMu.RUnlock()
 	return currentMigrationVersion, currentMigrationDirty, migrationVersionSet
 }
 
-func setMigrationVersion(version uint, dirty bool) {
-	migrationVersionOnce.Do(func() {
+// CachedMigrationError returns the error message captured when the most recent
+// migration attempt failed at startup. Empty string means migrations either
+// succeeded or were never run.
+func CachedMigrationError() string {
+	migrationStateMu.RLock()
+	defer migrationStateMu.RUnlock()
+	return currentMigrationError
+}
+
+// setMigrationState records the latest known migration state. Unlike the old
+// sync.Once-based setter, this is intentionally idempotent-overwrite so the
+// failure path (which runs after Up() errored) can replace the pre-migration
+// snapshot taken from the initial m.Version() call.
+func setMigrationState(version uint, dirty bool, errMsg string, versionKnown bool) {
+	migrationStateMu.Lock()
+	defer migrationStateMu.Unlock()
+	if versionKnown {
 		currentMigrationVersion = version
 		currentMigrationDirty = dirty
 		migrationVersionSet = true
-	})
+	}
+	currentMigrationError = errMsg
+}
+
+// captureMigrationFailure best-effort queries m for the current version so the
+// system info endpoint can show "N (failed)" instead of vanishing the row, and
+// stores the human-readable error message. Always returns the original error.
+func captureMigrationFailure(m *migrate.Migrate, err error) error {
+	versionKnown := false
+	var ver uint
+	var dirty bool
+	if m != nil {
+		v, d, vErr := m.Version()
+		if vErr == nil {
+			versionKnown = true
+			ver, dirty = v, d
+		}
+	}
+	setMigrationState(ver, dirty, err.Error(), versionKnown)
+	return err
 }
 
 // RunMigrations executes all pending database migrations
@@ -46,6 +89,12 @@ type MigrationOptions struct {
 	// AutoRecoverDirty when true, automatically attempts to recover from dirty state
 	// by forcing to the previous version and retrying the migration
 	AutoRecoverDirty bool
+
+	// SQLiteDBPath is the raw filesystem path to the SQLite database file.
+	// When set, the migrator opens the DB directly via sql.Open instead of
+	// parsing a URL-based DSN, which avoids breakage when the path contains
+	// spaces (e.g. macOS "Application Support").
+	SQLiteDBPath string
 }
 
 // RunMigrationsWithOptions executes all pending database migrations with custom options
@@ -59,10 +108,39 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 		migrationsPath = "file://migrations/sqlite"
 	}
 
-	m, err := migrate.New(migrationsPath, dsn)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to create migrate instance: %v", err)
-		return fmt.Errorf("failed to create migrate instance: %w", err)
+	var m *migrate.Migrate
+	if opts.SQLiteDBPath != "" {
+		sqlDB, err := sql.Open("sqlite3", opts.SQLiteDBPath)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to open sqlite db for migration: %v", err)
+			wrapped := fmt.Errorf("failed to open sqlite db for migration: %w", err)
+			setMigrationState(0, false, wrapped.Error(), false)
+			return wrapped
+		}
+		driver, err := sqlite3migrate.WithInstance(sqlDB, &sqlite3migrate.Config{})
+		if err != nil {
+			sqlDB.Close()
+			logger.Errorf(ctx, "Failed to create sqlite3 migrate driver: %v", err)
+			wrapped := fmt.Errorf("failed to create sqlite3 migrate driver: %w", err)
+			setMigrationState(0, false, wrapped.Error(), false)
+			return wrapped
+		}
+		m, err = migrate.NewWithDatabaseInstance(migrationsPath, "sqlite3", driver)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to create migrate instance: %v", err)
+			wrapped := fmt.Errorf("failed to create migrate instance: %w", err)
+			setMigrationState(0, false, wrapped.Error(), false)
+			return wrapped
+		}
+	} else {
+		var err error
+		m, err = migrate.New(migrationsPath, dsn)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to create migrate instance: %v", err)
+			wrapped := fmt.Errorf("failed to create migrate instance: %w", err)
+			setMigrationState(0, false, wrapped.Error(), false)
+			return wrapped
+		}
 	}
 	defer m.Close()
 
@@ -70,7 +148,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 	oldVersion, oldDirty, versionErr := m.Version()
 	if versionErr != nil && versionErr != migrate.ErrNilVersion {
 		logger.Errorf(ctx, "Failed to get migration version: %v", versionErr)
-		return fmt.Errorf("failed to get migration version: %w", versionErr)
+		return captureMigrationFailure(m, fmt.Errorf("failed to get migration version: %w", versionErr))
 	}
 
 	if versionErr == migrate.ErrNilVersion {
@@ -85,7 +163,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 		if opts.AutoRecoverDirty {
 			logger.Infof(ctx, "AutoRecoverDirty is enabled, attempting recovery...")
 			if err := recoverFromDirtyState(ctx, m, oldVersion); err != nil {
-				return err
+				return captureMigrationFailure(m, err)
 			}
 			// Update oldVersion after recovery
 			oldVersion, _, _ = m.Version()
@@ -95,7 +173,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 			if oldVersion == 0 || forceVersion < 0 {
 				forceVersion = 0
 			}
-			return fmt.Errorf(
+			return captureMigrationFailure(m, fmt.Errorf(
 				"database is in dirty state at version %d. This usually means a migration failed partway through. "+
 					"To fix this:\n"+
 					"1. Check if the migration partially applied changes and manually fix if needed\n"+
@@ -108,7 +186,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 				forceVersion,
 				forceVersion,
 				forceVersion,
-			)
+			))
 		}
 	}
 
@@ -124,13 +202,13 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 				logger.Infof(ctx, "Attempting to recover from dirty state...")
 				// Try to recover and retry
 				if recoverErr := recoverFromDirtyState(ctx, m, currentVersion); recoverErr != nil {
-					return recoverErr
+					return captureMigrationFailure(m, recoverErr)
 				}
 				// Retry migration after recovery
 				logger.Infof(ctx, "Retrying migration after recovery...")
 				if retryErr := m.Up(); retryErr != nil && retryErr != migrate.ErrNoChange {
 					logger.Errorf(ctx, "Migration failed after recovery attempt: %v", retryErr)
-					return fmt.Errorf("migration failed after recovery attempt: %w", retryErr)
+					return captureMigrationFailure(m, fmt.Errorf("migration failed after recovery attempt: %w", retryErr))
 				}
 			} else {
 				// Calculate the version to force to (usually the previous version)
@@ -138,7 +216,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 				if currentVersion == 0 {
 					forceVersion = 0
 				}
-				return fmt.Errorf(
+				return captureMigrationFailure(m, fmt.Errorf(
 					"migration failed and database is now in dirty state at version %d. "+
 						"To fix this:\n"+
 						"1. Check if the migration partially applied changes and manually fix if needed\n"+
@@ -151,20 +229,20 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 					forceVersion,
 					forceVersion,
 					forceVersion,
-				)
+				))
 			}
 		} else {
-			return fmt.Errorf("failed to run migrations: %w", err)
+			return captureMigrationFailure(m, fmt.Errorf("failed to run migrations: %w", err))
 		}
 	}
 
 	// Get current version after migration
 	version, dirty, err := m.Version()
 	if err != nil && err != migrate.ErrNilVersion {
-		return fmt.Errorf("failed to get migration version: %w", err)
+		return captureMigrationFailure(m, fmt.Errorf("failed to get migration version: %w", err))
 	}
 
-	setMigrationVersion(version, dirty)
+	setMigrationState(version, dirty, "", true)
 
 	if oldVersion != version {
 		logger.Infof(ctx, "Database migrated from version %d to %d", oldVersion, version)

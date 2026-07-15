@@ -5,8 +5,8 @@
       <p class="section-desc">{{ $t('knowledgeEditor.share.description') }}</p>
     </div>
     <div class="section-body">
-      <!-- 共享表单 -->
-      <div class="share-form">
+      <!-- 共享表单：仅 KB creator 或空间 Admin+ 可见，其他角色看到的是只读列表。 -->
+      <div v-if="canShare" class="share-form">
         <div class="form-item">
           <label class="form-label">{{ $t('organization.share.selectOrg') }}</label>
           <div class="share-input-row">
@@ -127,7 +127,7 @@
                 </span>
               </div>
             </div>
-            <div class="share-actions">
+            <div v-if="canShare" class="share-actions">
               <t-select
                 :value="share.permission"
                 size="small"
@@ -163,7 +163,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
 import { useOrganizationStore } from '@/stores/organization'
@@ -180,9 +180,15 @@ function getOrgForShare(organizationId: string) {
 
 interface Props {
   kbId: string
+  // 后端 POST/PUT/DELETE /knowledge-bases/:id/shares 受 OwnedKBOrAdmin
+  // 守卫：仅 KB creator 或空间 Admin+ 能改动共享。父组件根据 KB.creator_id
+  // 计算后传入，缺省 false 表示只读。
+  canShare?: boolean
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  canShare: false,
+})
 
 const loadingOrgs = ref(false)
 const loadingShares = ref(false)
@@ -298,31 +304,25 @@ watch(() => props.kbId, async (newKbId) => {
     await Promise.all([loadOrganizations(), loadShares()])
   }
 }, { immediate: true })
-
-onMounted(async () => {
-  if (props.kbId) {
-    await Promise.all([loadOrganizations(), loadShares()])
-  }
-})
 </script>
 
 <style scoped lang="less">
 .section-content {
   .section-header {
-    margin-bottom: 20px;
+    margin-bottom: 16px;
   }
 
   .section-title {
-    margin: 0 0 8px 0;
-    font-family: "PingFang SC";
-    font-size: 16px;
+    margin: 0 0 6px 0;
+    font-family: var(--app-font-family);
+    font-size: 20px;
     font-weight: 600;
     color: var(--td-text-color-primary);
   }
 
   .section-desc {
     margin: 0;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 14px;
     color: var(--td-text-color-placeholder);
     line-height: 22px;
@@ -339,8 +339,8 @@ onMounted(async () => {
   .form-label {
     display: block;
     margin-bottom: 8px;
-    font-family: "PingFang SC";
-    font-size: 14px;
+    font-family: var(--app-font-family);
+    font-size: 15px;
     font-weight: 500;
     color: var(--td-text-color-primary);
   }
@@ -381,8 +381,8 @@ onMounted(async () => {
   margin-bottom: 16px;
 
   .shares-title {
-    font-family: "PingFang SC";
-    font-size: 14px;
+    font-family: var(--app-font-family);
+    font-size: 15px;
     font-weight: 500;
     color: var(--td-text-color-primary);
   }
@@ -465,7 +465,7 @@ onMounted(async () => {
   gap: 8px;
 
   .org-name {
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 14px;
     font-weight: 500;
     color: var(--td-text-color-primary);
@@ -598,7 +598,7 @@ onMounted(async () => {
   margin-bottom: 2px;
 
   .org-option-name {
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 13px;
     font-weight: 500;
     color: var(--td-text-color-primary);
@@ -612,7 +612,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   color: var(--td-text-color-secondary);
 

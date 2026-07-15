@@ -9,7 +9,7 @@ The client includes the following main functional modules:
 1. **Session Management**: Create, retrieve, update, and delete sessions
 2. **Knowledge Base Management**: Create, retrieve, update, and delete knowledge bases
 3. **Knowledge Management**: Add, retrieve, and delete knowledge content
-4. **Tenant Management**: CRUD operations for tenants
+4. **Workspace Management**: CRUD operations for workspaces
 5. **Knowledge Q&A**: Supports regular Q&A and streaming Q&A
 6. **Chunk Management**: Query, update, and delete knowledge chunks
 7. **Message Management**: Retrieve and delete session messages
@@ -23,7 +23,7 @@ The client includes the following main functional modules:
 ```go
 import (
     "context"
-    "github.com/Tencent/WeKnora/internal/client"
+    "github.com/Tencent/WeKnora/client"
     "time"
 )
 
@@ -33,6 +33,26 @@ apiClient := client.NewClient(
     client.WithToken("your-auth-token"),
     client.WithTimeout(30*time.Second),
 )
+```
+
+### Workspace Configuration
+
+You can set a default workspace with `WithTenantID`; the client will automatically send the `X-Tenant-ID` header:
+
+```go
+tenantID := uint64(10000)
+apiClient := client.NewClient(
+    "http://api.example.com",
+    client.WithToken("your-auth-token"),
+    client.WithTenantID(tenantID),
+)
+```
+
+If a single request needs a different workspace, set `TenantID` in the request context. The value can be a `uint64`, `*uint64`, or a numeric string, and it will take precedence over the client default:
+
+```go
+ctx := context.WithValue(context.Background(), "TenantID", uint64(10000))
+// Pass ctx into any client method to switch to workspace 10000 for that request
 ```
 
 ### Example: Create Knowledge Base and Upload File
