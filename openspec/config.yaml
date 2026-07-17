@@ -1,0 +1,28 @@
+schema: spec-driven
+
+context: |
+  WeKnora 是多租户知识管理平台。根服务为 Go 1.26（Gin、dig、GORM），前端为 Vue 3 + TypeScript + Vite，
+  DocReader 是 Python + gRPC 服务，另有独立 Go SDK、CLI 和微信小程序。
+
+  分层：internal/handler 只处理 HTTP 传输；internal/application/service 编排业务与异步任务；
+  internal/application/repository 持久化；internal/infrastructure 适配外部系统；internal/container 统一注入。
+  REST 路由必须保持 Auth、RBAC、审计和 API Key capability gate；所有 tenant 归属数据、查询、缓存和任务
+  均以可信上下文的 tenant_id 隔离。OIDC 是身份认证集成，tenant/user/member/role/API Key 是平台自身权威状态。
+
+  公开 REST 变更同步 Swagger、docs/api 与前端；gRPC 变更以 docreader/proto/docreader.proto 为源并重生成
+  Go/Python 代码；schema 变更只新增 migrations/versioned 成对迁移，并评估 PostgreSQL 与 Lite/SQLite。
+  异步任务使用现有 Asynq 队列。严禁提交秘密、跨租户数据、未经脱敏日志或未经确认的接口/业务规则。
+
+rules:
+  proposal:
+    - 明确问题、目标、非目标、受影响的模块、用户/数据/权限影响、兼容与回滚策略；不把未确认的假设写成事实。
+    - 涉及 API、CLI、gRPC、迁移、配置、RBAC/API Key、异步任务或外部访问时，必须点明对应契约和风险。
+  design:
+    - 给出经过现有实现核对的分层落点、数据流、授权路径、错误处理、幂等/重试和测试策略；禁止以关键词匹配替代领域规则。
+    - database 设计沿用 tenant_id、当前 GORM/PostgreSQL/SQLite 模型和已发布迁移的命名、索引、时间戳及级联语义。
+  specs:
+    - 每项 Requirement 使用 SHALL，并给出可验证的 WHEN/THEN 场景；安全、越权、错误和兼容场景不能省略。
+    - 需求只描述已确认业务行为；字段、默认值、权限和上游依赖不明确时标为待确认，不得编造。
+  tasks:
+    - 任务按可独立验证的里程碑排序，明确文件/层次、契约同步、迁移/生成物、测试和文档工作。
+    - 实现只能执行 tasks.md 中的任务；发现新范围先更新 proposal/design/specs/tasks 并保持产物一致。

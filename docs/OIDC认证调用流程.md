@@ -556,7 +556,7 @@ OIDC 配置定义位于 `internal/config/config.go`，环境变量示例见 `.en
 ## 13. 本地联调示例（Dex）
 [Dex](https://dexidp.io/) 是一个简单易用的OIDC Provider，您可以通过它对接多种第三方认证系统（如OAuth2.0，Google，GitHub，LDAP等）。除了Dex之外，您也可以选择[KeyCloak](https://www.keycloak.org/)等其他符合OpenID Connect协议的Provider进行接入。
 
-项目中已提供 Dex 示例配置：`misc/dex-config.yaml`。
+项目中提供两份 Dex 示例配置：生产 Compose 继续使用 `misc/dex-config.yaml`，本地开发的 `docker-compose.dev.yml` 使用 `misc/dex-config.dev.yaml`。开发配置不会写入真实密钥，而是通过 `secretEnv` 从容器环境读取：
 
 其中静态客户端配置示例：
 
@@ -567,8 +567,10 @@ staticClients:
       - 'http://127.0.0.1:5173/api/v1/auth/oidc/callback'
       - 'http://127.0.0.1/api/v1/auth/oidc/callback'
     name: 'WeKnora'
-    # secret: <YOUR_SECRET_HERE>
+    secretEnv: OIDC_AUTH_CLIENT_SECRET
 ```
+
+未设置该变量时，开发 Compose 只为保证 Dex 容器可启动而注入一个明确标注为本地专用的占位值。若要真正启用 WeKnora 的本地 OIDC 登录，必须在 `.env` 中显式设置 `OIDC_AUTH_CLIENT_ID=weknora` 和非空的 `OIDC_AUTH_CLIENT_SECRET`；开发脚本会将同一个 secret 同时提供给本地后端和 Dex。不要把本地占位值用于共享或生产环境。
 
 这说明本地调试时，需要确保 **Provider 注册的 redirect URI 与前端实际传给后端的 `redirect_uri` 完全一致**。
 

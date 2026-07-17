@@ -305,8 +305,11 @@ services:
     container_name: WeKnora-dex-dev
     ports:
       - "5556:5556"
+    environment:
+      # 仅用于本地开发。启用后端 OIDC 时应在 .env 中显式设置同名变量，覆盖此占位值。
+      OIDC_AUTH_CLIENT_SECRET: ${OIDC_AUTH_CLIENT_SECRET:-weknora-local-dev-only-change-me}
     volumes:
-      - ./misc/dex-config.yaml:/etc/dex/config.yaml
+      - ./misc/dex-config.dev.yaml:/etc/dex/config.yaml:ro
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     profiles:
       - dex

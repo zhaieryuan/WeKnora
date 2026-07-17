@@ -49,13 +49,22 @@ detect_compose_cmd() {
     return 1
 }
 
+# 完整开发环境依赖 Compose 的 --wait/--wait-timeout 语义，确保长驻服务退出或
+# 健康检查失败时不会继续输出“启动成功”。旧版 Compose 缺少该能力时应明确失败。
+compose_supports_wait() {
+    local up_help
+    up_help=$("$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD up --help 2>&1) || return 1
+    printf '%s\n' "$up_help" | grep -q -- '--wait' &&
+        printf '%s\n' "$up_help" | grep -q -- '--wait-timeout'
+}
+
 # 显示帮助信息
 show_help() {
     printf "%b\n" "${GREEN}WeKnora 开发环境脚本${NC}"
     echo "用法: $0 [命令] [选项]"
     echo ""
     echo "命令:"
-    echo "  start      启动基础设施服务（postgres, redis, docreader, langfuse）"
+    echo "  start      启动完整开发基础设施（默认不含按需服务）"
     echo "  stop       停止所有服务"
     echo "  restart    重启所有服务"
     echo "  logs       查看服务日志"
@@ -64,23 +73,21 @@ show_help() {
     echo "  frontend   启动前端开发服务器（本地运行）"
     echo "  help       显示此帮助信息"
     echo ""
-    echo "可选 Profile（用于 start 命令）:"
-    echo "  --minio       启动 MinIO 对象存储"
-    echo "  --qdrant      启动 Qdrant 向量数据库"
-    echo "  --neo4j       启动 Neo4j 图数据库"
-    echo "  --dex         启动 Dex（OIDC 身份认证）"
-    echo "  --langfuse    启动 Langfuse（默认已开启）"
-    echo "  --no-langfuse 不启动 Langfuse"
-    echo "  --odl-hybrid  启动 OpenDataLoader hybrid（Docling，镜像较大，按需启用）"
-    echo "  --full        启动所有可选服务（不含 odl-hybrid，需另加 --odl-hybrid）"
+    echo "默认基础设施: postgres、redis、docreader、searxng、minio、qdrant、opensearch、milvus、neo4j、dex、langfuse"
+    echo ""
+    echo "可选参数（用于 start 命令）:"
+    echo "  --no-langfuse    不启动 Langfuse，其余完整基础设施保持启动"
+    echo "  --odl-hybrid     启动 OpenDataLoader hybrid（Docling，镜像较大，按需启用）"
+    echo "  --opensearch-ui  启动 OpenSearch Dashboards（仅索引检视界面，按需启用）"
+    echo "  --full           与默认基础设施相同（兼容已有调用）"
+    echo "  DEV_START_WAIT_SEC 可在 .env 中设置就绪等待秒数（正整数，默认 180）"
     echo ""
     echo "示例："
-    echo "  $0 start                    # 启动基础服务"
-    echo "  $0 start --qdrant           # 启动基础服务 + Qdrant"
-    echo "  $0 start --dex             # 启动基础服务 + Dex"
-    echo "  $0 start --odl-hybrid       # 启动基础服务 + OpenDataLoader hybrid"
-    echo "  $0 start --full             # 启动所有服务"
-    echo "  make dev-start DEV_ARGS=--odl-hybrid   # 同上（Makefile 传参）"
+    echo "  $0 start                         # 启动完整开发基础设施"
+    echo "  $0 start --no-langfuse            # 启动不含 Langfuse 的完整基础设施"
+    echo "  $0 start --odl-hybrid             # 完整基础设施 + OpenDataLoader hybrid"
+    echo "  $0 start --opensearch-ui          # 完整基础设施 + OpenSearch Dashboards"
+    echo "  make dev-start DEV_ARGS=--odl-hybrid  # 同上（Makefile 传参）"
     echo "  $0 app                      # 在另一个终端启动后端"
     echo "  $0 frontend                 # 在另一个终端启动前端"
 }
@@ -137,8 +144,7 @@ _should_enable_odl_hybrid_from_env() {
 }
 
 _enable_odl_hybrid_profile() {
-    PROFILES="$PROFILES --profile odl-hybrid"
-    ENABLED_SERVICES="$ENABLED_SERVICES odl-hybrid"
+    ENABLE_ODL_HYBRID=true
 }
 
 # 等待 odl-hybrid HTTP 健康检查通过（compose 启动后服务可能仍在拉依赖）
@@ -195,48 +201,58 @@ start_services() {
         log_info "接下来: make dev-app（本地后端）或 make dev-frontend（前端）"
         return 0
     fi
+
+    # DEV_START_WAIT_SEC 只接受正整数。显式配置为空也视为错误，避免 Compose
+    # 收到无效超时后以难以定位的参数错误退出。
+    local start_wait_sec
+    if [ "${DEV_START_WAIT_SEC+x}" = "x" ]; then
+        start_wait_sec="$DEV_START_WAIT_SEC"
+    else
+        start_wait_sec=180
+    fi
+    case "$start_wait_sec" in
+        ''|*[!0-9]*)
+            log_error "DEV_START_WAIT_SEC 必须是正整数（秒），当前值无效"
+            return 1
+            ;;
+    esac
+    if [ "$start_wait_sec" -le 0 ]; then
+        log_error "DEV_START_WAIT_SEC 必须大于 0（秒）"
+        return 1
+    fi
+
+    if ! compose_supports_wait; then
+        log_error "当前 Docker Compose 不支持 up --wait/--wait-timeout，请升级 Docker Compose 后重试"
+        return 1
+    fi
     
-    # 解析 profile 参数
+    # 解析 profile 参数。完整开发基线由 Compose 的 full profile 定义，避免脚本和
+    # docker-compose.dev.yml 分别维护服务列表而再次发生遗漏。
     shift  # 移除 "start" 命令本身
-    # 默认启动基础设施（postgres / redis / docreader）+ langfuse，
-    # 其余可选服务通过 --minio / --qdrant / --neo4j / --dex / --full 按需开启。
-    PROFILES="--profile langfuse"
-    ENABLED_SERVICES="langfuse"
+    PROFILES="--profile full"
+    ENABLED_SERVICES="searxng minio qdrant opensearch milvus neo4j dex langfuse sandbox"
+    EXCLUDE_LANGFUSE=false
+    ENABLE_ODL_HYBRID=false
+    ENABLE_OPENSEARCH_UI=false
     while [ $# -gt 0 ]; do
         case "$1" in
-            --minio)
-                PROFILES="$PROFILES --profile minio"
-                ENABLED_SERVICES="$ENABLED_SERVICES minio"
-                ;;
-            --qdrant)
-                PROFILES="$PROFILES --profile qdrant"
-                ENABLED_SERVICES="$ENABLED_SERVICES qdrant"
-                ;;
-            --neo4j)
-                PROFILES="$PROFILES --profile neo4j"
-                ENABLED_SERVICES="$ENABLED_SERVICES neo4j"
-                ;;
-            --dex)
-                PROFILES="$PROFILES --profile dex"
-                ENABLED_SERVICES="$ENABLED_SERVICES dex"
+            --minio|--qdrant|--neo4j|--dex)
+                # 这些服务已属于完整默认基线；保留旧参数以兼容已有调用。
                 ;;
             --langfuse)
-                PROFILES="$PROFILES --profile langfuse"
-                ENABLED_SERVICES="$ENABLED_SERVICES langfuse"
+                EXCLUDE_LANGFUSE=false
                 ;;
             --no-langfuse)
-                PROFILES="${PROFILES//--profile langfuse/}"
-                ENABLED_SERVICES="${ENABLED_SERVICES//langfuse/}"
+                EXCLUDE_LANGFUSE=true
                 ;;
             --odl-hybrid)
-                if [[ "$ENABLED_SERVICES" != *"odl-hybrid"* ]]; then
-                    _enable_odl_hybrid_profile
-                fi
+                _enable_odl_hybrid_profile
+                ;;
+            --opensearch-ui)
+                ENABLE_OPENSEARCH_UI=true
                 ;;
             --full)
-                PROFILES="--profile full"
-                ENABLED_SERVICES="minio qdrant neo4j dex"
-                break
+                # 默认已使用 full；保留参数以兼容已有调用。
                 ;;
             *)
                 log_warning "未知参数: $1"
@@ -245,17 +261,82 @@ start_services() {
         shift
     done
 
-    # 启动服务（odl-hybrid 单独 --build，避免每次重建 docreader）
-    "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES up -d
+    # Compose profile 是叠加关系，无法从 full 中移除 Langfuse。因此 opt-out 时
+    # 显式选择 full 所含的非 Langfuse 服务；postgres、redis 与 docreader 无 profile，
+    # 无论何种选择都会保留。
+    if [ "$EXCLUDE_LANGFUSE" = true ]; then
+        PROFILES="--profile searxng --profile minio --profile qdrant --profile opensearch --profile milvus --profile neo4j --profile dex"
+        ENABLED_SERVICES="searxng minio qdrant opensearch milvus neo4j dex"
+    fi
+    if [ "$ENABLE_ODL_HYBRID" = true ]; then
+        PROFILES="$PROFILES --profile odl-hybrid"
+        ENABLED_SERVICES="$ENABLED_SERVICES odl-hybrid"
+    fi
+    if [ "$ENABLE_OPENSEARCH_UI" = true ]; then
+        PROFILES="$PROFILES --profile opensearch-ui"
+        ENABLED_SERVICES="$ENABLED_SERVICES opensearch-ui"
+    fi
+
+    # 长驻服务目标始终从 Compose 的已选 profile 动态解析，避免在脚本中复制 full
+    # 服务清单。三个一次性任务不作为 --wait 的顶层目标；其中两个 init 会由依赖
+    # 自动启动，sandbox 则在下方单独运行并核验真实退出码。
+    local selected_services
+    local wait_services
+    selected_services=$("$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES config --services)
     local compose_rc=$?
+    if [ "$compose_rc" -eq 0 ]; then
+        wait_services=$(printf '%s\n' "$selected_services" | grep -Ev '^(sandbox|searxng-init|langfuse-db-init)$' | tr '\n' ' ')
+        if [ -z "$wait_services" ]; then
+            log_error "未解析到需要启动的长驻开发服务"
+            compose_rc=1
+        fi
+    fi
+
+    # sandbox 是镜像准备任务，不是长驻依赖。Compose --wait 会把顶层 Exited (0)
+    # 视为失败，因此单独启动并通过 docker wait 校验它是否真正成功完成。
+    if [ "$compose_rc" -eq 0 ] && printf '%s\n' "$selected_services" | grep -qx 'sandbox'; then
+        "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES up -d sandbox
+        compose_rc=$?
+        if [ "$compose_rc" -eq 0 ]; then
+            local sandbox_id
+            local sandbox_exit
+            sandbox_id=$("$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES ps -aq sandbox | tail -n 1)
+            if [ -z "$sandbox_id" ]; then
+                log_error "sandbox 镜像准备任务未创建容器"
+                compose_rc=1
+            else
+                sandbox_exit=$(docker wait "$sandbox_id")
+                compose_rc=$?
+                if [ "$compose_rc" -eq 0 ] && [ "$sandbox_exit" != "0" ]; then
+                    log_error "sandbox 镜像准备任务失败（退出码 ${sandbox_exit}）"
+                    compose_rc=1
+                fi
+            fi
+        fi
+    fi
+
+    # 等待 Compose 认可全部长驻服务的运行/健康状态。依赖型 init 成功退出由
+    # Compose 视为完成；任何非零退出、unhealthy 或超时都会返回失败。
+    # odl-hybrid 后续仍单独 --build，避免每次重建 docreader。
+    if [ "$compose_rc" -eq 0 ]; then
+        "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES \
+            up -d --wait --wait-timeout "$start_wait_sec" $wait_services
+        compose_rc=$?
+    fi
     if [ "$compose_rc" -eq 0 ] && [[ "$ENABLED_SERVICES" == *"odl-hybrid"* ]]; then
         log_info "构建/更新 odl-hybrid 镜像..."
         "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES up -d --build odl-hybrid
-        _wait_odl_hybrid_ready || true
+        compose_rc=$?
+        if [ "$compose_rc" -eq 0 ]; then
+            _wait_odl_hybrid_ready
+            compose_rc=$?
+        fi
         # docreader 需读取 DOCREADER_ODL_HYBRID；若刚改 .env，强制重建以注入环境变量
-        if _should_enable_odl_hybrid_from_env; then
+        if [ "$compose_rc" -eq 0 ] && _should_enable_odl_hybrid_from_env; then
             log_info "重建 docreader 以应用 DOCREADER_ODL_HYBRID=${DOCREADER_ODL_HYBRID} ..."
-            "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml up -d --force-recreate docreader
+            "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml \
+                up -d --force-recreate --wait --wait-timeout "$start_wait_sec" docreader
+            compose_rc=$?
         fi
     fi
 
@@ -274,6 +355,15 @@ start_services() {
         if [[ "$ENABLED_SERVICES" == *"qdrant"* ]]; then
             echo "  - Qdrant:        localhost:6333 (gRPC: localhost:6334)"
         fi
+        if [[ "$ENABLED_SERVICES" == *"opensearch"* ]]; then
+            echo "  - OpenSearch:    http://localhost:9200"
+        fi
+        if [[ "$ENABLED_SERVICES" == *"opensearch-ui"* ]]; then
+            echo "  - OpenSearch UI: http://localhost:5601"
+        fi
+        if [[ "$ENABLED_SERVICES" == *"milvus"* ]]; then
+            echo "  - Milvus:        localhost:19530 (health: localhost:9091)"
+        fi
         if [[ "$ENABLED_SERVICES" == *"neo4j"* ]]; then
             echo "  - Neo4j:         localhost:7474 (Bolt: localhost:7687)"
         fi
@@ -287,6 +377,8 @@ start_services() {
             echo "  - ODL Hybrid:    http://localhost:${ODL_HYBRID_PORT:-5002} (health: /health)"
             echo "                   docreader 需 DOCREADER_ODL_HYBRID=docling-fast"
         fi
+        echo ""
+        log_info "按需服务: --odl-hybrid（Docling 镜像构建）和 --opensearch-ui（索引检视界面）"
         
         echo ""
         log_info "接下来的步骤:"
@@ -294,7 +386,8 @@ start_services() {
         printf "%b\n" "${YELLOW}2. 在新终端运行前端:${NC} make dev-frontend"
         return 0
     else
-        log_error "服务启动失败"
+        log_error "服务启动或就绪检查失败（超时 ${start_wait_sec}s）"
+        "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml $PROFILES ps -a || true
         return 1
     fi
 }
@@ -309,22 +402,32 @@ stop_services() {
     fi
     
     cd "$PROJECT_ROOT"
-    "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml down
-    
-    if [ $? -eq 0 ]; then
-        log_success "所有服务已停止"
-        return 0
-    else
+    # wildcard profile 覆盖 full、Langfuse 与所有按需服务；不传 --volumes，保留
+    # 开发数据。--remove-orphans 用于清理旧配置遗留的同项目容器。
+    "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml --profile '*' down --remove-orphans
+    local compose_rc=$?
+    if [ "$compose_rc" -ne 0 ]; then
         log_error "服务停止失败"
         return 1
     fi
+
+    local remaining_containers
+    remaining_containers=$("$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml --profile '*' ps -aq)
+    if [ -n "$remaining_containers" ]; then
+        log_error "服务停止不完整，仍有 WeKnora 开发容器残留"
+        "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -f docker-compose.dev.yml --profile '*' ps -a || true
+        return 1
+    fi
+
+    log_success "所有服务已停止"
+    return 0
 }
 
 # 重启服务
 restart_services() {
-    stop_services
+    stop_services || return 1
     sleep 2
-    start_services
+    start_services start
 }
 
 # 查看日志
@@ -546,4 +649,5 @@ case "$CMD" in
         ;;
 esac
 
-exit 0
+# 保留所选命令的真实退出码，使 make 和 CI 能识别启动、停止或运行失败。
+exit $?

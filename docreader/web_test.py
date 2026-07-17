@@ -639,7 +639,7 @@ def read_document():
         # 调用 gRPC 服务
         with grpc.insecure_channel(GRPC_ADDRESS) as channel:
             client = docreader_pb2_grpc.DocReaderStub(channel)
-            response = client.Read(req, timeout=30)
+            response = client.Read(req)
 
             # 返回结果
             result = {
